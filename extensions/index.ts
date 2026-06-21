@@ -322,9 +322,10 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const meta = await resolveModel(id, cache);
       const ctx = meta.contextWindow;
       const maxTokens = Math.min(ctx, maxOut);
+      const regId = resolveRepoId(id) ?? id;
       regModels.push({
-        id,
-        name: resolveRepoId(id) ?? id.split("/").pop() ?? id,
+        id: regId,
+        name: id.split("/").pop() ?? id,
         reasoning: meta.reasoning,
         input: meta.vision ? (["text", "image"] as const) : (["text"] as const),
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
