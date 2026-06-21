@@ -451,6 +451,12 @@ async function discoverAndRegister(pi: ExtensionAPI) {
         compat: meta.reasoning
           ? { ...baseCompat, thinkingFormat: "qwen-chat-template" as const }
           : baseCompat,
+        // MLX treats enable_thinking as a boolean toggle, so all non-off pi
+        // thinking levels are identical. Hide the intermediate levels and keep
+        // only off (disable) + high (enable) for an honest selector.
+        ...(meta.reasoning
+          ? { thinkingLevelMap: { minimal: null, low: null, medium: null, xhigh: null } as const }
+          : {}),
       });
       registered++;
     }
