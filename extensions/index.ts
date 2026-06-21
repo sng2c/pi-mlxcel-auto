@@ -211,7 +211,23 @@ async function fetchText(url: string, timeoutMs: number): Promise<string | null>
 }
 
 async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
-  // 1) local store
+  // 1) Hugging Face first (remote-first). Works for remote mlxcel servers
+  //    where local model files are absent, and gives consistent metadata.
+  const repoId = resolveRepoId(modelId);
+  if (repoId) {
+    const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
+    if (cfg && typeof cfg === "object") {
+      const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
+      const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
+      let template = extractTemplate(tokCfg, null);
+      if (!template) {
+        const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
+        if (jinja) template = jinja;
+      }
+      return { cfg, tokCfg, genCfg, template, source: "hf" };
+    }
+  }
+  // 2) local failover: offline, gated/private, or local-path model ids.
   const dir = localModelDir(modelId);
   if (dir) {
     const cfg = readJsonFile(join(dir, "config.json"));
@@ -222,19 +238,7 @@ async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
       return { cfg, tokCfg, genCfg, template, source: "local" };
     }
   }
-  // 2) Hugging Face config + tokenizer_config + generation_config + chat_template.jinja
-  const repoId = resolveRepoId(modelId);
-  if (!repoId) return null;
-  const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
-  if (!cfg || typeof cfg !== "object") return null;
-  const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
-  const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
-  let template = extractTemplate(tokCfg, null);
-  if (!template) {
-    const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
-    if (jinja) template = jinja;
-  }
-  return { cfg, tokCfg, genCfg, template, source: "hf" };
+  return null;
 }
 
 // --- detection -------------------------------------------------------------
