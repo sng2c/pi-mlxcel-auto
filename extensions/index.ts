@@ -53,7 +53,7 @@ const CTX_KEYS = [
 type Cfg = Record<string, any> | null;
 
 interface CacheEntry {
-  contextWindow: number;
+  modelMaxCtx: number;
   vision: boolean;
   reasoning: boolean;
   tools: boolean;
@@ -271,20 +271,26 @@ async function probePort(host: string, port: number): Promise<any[] | null> {
 
 async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> {
   const cached = cache[modelId];
-  if (cached) return cached;
+  if (cached) {
+    // Migrate pre-0.3.0 entries that used `contextWindow`.
+    if (cached.modelMaxCtx == null && (cached as any).contextWindow != null) {
+      cached.modelMaxCtx = (cached as any).contextWindow;
+    }
+    return cached;
+  }
 
   const meta = await loadModelMeta(modelId);
   const fbCtx = envInt("MLXCEL_AUTO_FALLBACK_CTX", 32768);
   if (!meta) {
     const entry: CacheEntry = {
-      contextWindow: fbCtx, vision: false, reasoning: false, tools: false,
+      modelMaxCtx: fbCtx, vision: false, reasoning: false, tools: false,
       source: "fallback", ts: Date.now(),
     };
     cache[modelId] = entry;
     return entry;
   }
   const entry: CacheEntry = {
-    contextWindow: extractContext(meta.cfg) ?? fbCtx,
+    modelMaxCtx: extractContext(meta.cfg) ?? fbCtx,
     vision: isVision(meta.cfg, meta.tokCfg),
     reasoning: detectReasoning(meta.cfg, meta.tokCfg, meta.template),
     tools: detectTools(meta.cfg, meta.tokCfg, meta.template),
@@ -293,6 +299,24 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
   };
   cache[modelId] = entry;
   return entry;
+}
+
+// Query the server's effective per-slot context window. mlxcel-server reports
+// `context_size` on /health and /slots. With `--ctx-size 0` (model default) it
+// reports 0, meaning unbounded up to model max, so the caller keeps the model
+// max. With an explicit `--ctx-size C --parallel N`, it reports floor(C / N),
+// the real per-slot budget, which should override.
+async function fetchEffectiveCtx(host: string, port: number): Promise<number> {
+  const h = await fetchJson(`http://${host}:${port}/health`, PROBE_TIMEOUT_MS);
+  if (h && Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
+  const slots = await fetchJson(`http://${host}:${port}/slots`, PROBE_TIMEOUT_MS);
+  if (Array.isArray(slots)) {
+    for (const s of slots) {
+      const cs = s?.context_size;
+      if (Number.isFinite(cs) && cs > 0) return cs;
+    }
+  }
+  return 0;
 }
 
 async function discoverAndRegister(pi: ExtensionAPI) {
@@ -315,12 +339,13 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       continue;
     }
     const providerId = port === 8080 ? "mlxcel-auto" : `mlxcel-auto-${port}`;
+    const effectiveCtx = await fetchEffectiveCtx(host, port);
     const regModels = [];
     for (const m of models) {
       const id: string = m.id ?? m.model ?? "";
       if (!id) continue;
       const meta = await resolveModel(id, cache);
-      const ctx = meta.contextWindow;
+      const ctx = effectiveCtx > 0 ? effectiveCtx : meta.modelMaxCtx;
       const maxTokens = Math.min(ctx, maxOut);
       const regId = resolveRepoId(id) ?? id;
       const baseCompat = {

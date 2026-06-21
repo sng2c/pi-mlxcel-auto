@@ -58,6 +58,7 @@ Then in pi:
 ## Notes / limitations
 
 - **reasoning**: detected from chat template tokens (`enable_thinking` / `reasoning_content` / `<think>...</think>`). When detected, `reasoning: true` and `compat.thinkingFormat: "qwen-chat-template"` are set so pi drives MLX's `chat_template_kwargs.enable_thinking` (`off` disables, others enable). Set `MLXCEL_AUTO_NO_REASONING=1` to opt out.
+- **context window**: resolved from the server's effective per-slot `context_size` (`/health` or `/slots`) when `--ctx-size` is set explicitly; otherwise falls back to the model's max from `config.json` (`max_position_embeddings`). This prevents pi from assuming a larger window than the server actually allocated.
 - **vision**: detected from `vision_config` or tokenizer image/video tokens. Maps to `input: ["text","image"]`. Video/audio are not expressible in pi's model `input` field (text/image only).
 - **tools**: detected from chat template tool-call markers or `tool_parser_type`. Informational only — pi has no per-model tool toggle, so it is cached as metadata and not reflected in registration.
 - `reasoning` defaults to `false` when not detected. Add a `mlxcel` provider in `~/.pi/agent/models.json` to override per model — this extension uses the `mlxcel-auto` provider id so there is no collision.
