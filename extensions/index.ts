@@ -539,4 +539,38 @@ export default async function (pi: ExtensionAPI) {
       ctx.ui.notify(lines.join(" | "), r.failures.length && r.registered === 0 ? "warn" : "info");
     },
   });
+
+  pi.registerCommand("mlxcel-auto-info", {
+    description: "Show detected metadata for cached mlxcel-auto models (optional substring filter)",
+    handler: async (args, ctx) => {
+      const cache = loadCache();
+      const ids = Object.keys(cache);
+      if (!ids.length) {
+        ctx.ui.notify("mlxcel-auto: no cached models. Run /mlxcel-auto first.", "warn");
+        return;
+      }
+      const arg = (args || "").trim();
+      const lines: string[] = [];
+      for (const id of ids) {
+        if (arg && !id.includes(arg)) continue;
+        const e = cache[id];
+        lines.push(
+          `${id}: ctx ${e.modelMaxCtx} | vision ${e.vision ? "yes" : "no"} | reasoning ${e.reasoning ? "yes" : "no"} | tools ${e.tools ? "yes" : "no"} | ${e.source}`,
+        );
+        const meta = [
+          e.modelType ? `model_type=${e.modelType}` : null,
+          e.architectures ? `arch=${e.architectures.join("|")}` : null,
+          e.quantization ? `quant=${e.quantization}` : null,
+          e.eosToken != null ? `eos=${e.eosToken}` : null,
+          e.genMaxNewTokens != null ? `genMaxNewTokens=${e.genMaxNewTokens}` : null,
+        ].filter(Boolean);
+        if (meta.length) lines.push(`  ${meta.join("  ")}`);
+      }
+      if (!lines.length) {
+        ctx.ui.notify(`mlxcel-auto: no cached model matching "${arg}"`, "warn");
+        return;
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
 }

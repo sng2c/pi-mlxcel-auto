@@ -67,6 +67,28 @@ Then in pi:
 - If you launch with `--alias <custom>` the id is not a repo id and cannot be resolved; fall back to a manual `models.json` entry in that case.
 - `mlxcel-server` reports the bare snapshot directory name in `/v1/models` even when launched with a full `owner/name` repo id; the bare-name → `mlx-community/<name>` mapping handles this.
 
+## Cache
+
+`~/.pi/agent/extensions-data/mlxcel-auto-cache.json` maps each model id (as returned by `/v1/models`) to:
+
+| field | description |
+| --- | --- |
+| `modelMaxCtx` | model max context from `config.json` (`max_position_embeddings`, top-level or `text_config.*`), else `tokenizer_config.model_max_length`, else `MLXCEL_AUTO_FALLBACK_CTX` |
+| `vision` | from `vision_config`, tokenizer image/video tokens, or chat-template ids |
+| `reasoning` | from chat-template ids (`enable_thinking` / `reasoning_content` / `clear_thinking` / `think`); disabled by `MLXCEL_AUTO_NO_REASONING=1` |
+| `tools` | from `tool_parser_type` or chat-template `tools`+`tool_call*` ids; informational only |
+| `source` | `local` (mlxcel store), `hf` (Hugging Face fetch), or `fallback` (detection failed) |
+| `ts` | detection timestamp (ms) |
+| `modelType` | `config.model_type` (or `text_config.model_type`) |
+| `architectures` | `config.architectures` array |
+| `eosToken` | `config.eos_token_id` or `tokenizer_config.eos_token` (string or id array) |
+| `quantization` | e.g. `4-bit` from `config.quantization.bits` |
+| `genMaxNewTokens` | `generation_config.max_new_tokens` / `max_length` when present |
+
+The registered `contextWindow` is the server's effective per-slot `context_size` (`/health` or `/slots`) when `--ctx-size` is set explicitly, otherwise `modelMaxCtx`.
+
+Inspect from pi with `/mlxcel-auto-info [substring]`.
+
 ## License
 
 MIT
