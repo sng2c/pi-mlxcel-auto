@@ -53,6 +53,21 @@ const CTX_KEYS = [
 
 type Cfg = Record<string, any> | null;
 
+// Trailing stop tokens some MLX chat templates leak into assistant text. These
+// are stripped from the finalized assistant message via a `message_end` hook.
+// Per-model string eos tokens from config/tokenizer_config are added at reg.
+const STOP_TOKENS = [
+  "<|im_end|>",
+  "<|endofsentext|>",
+  "<|endoftext|>",
+  "<end_of_turn>",
+  "<start_of_turn>",
+  "",
+  "",
+  "",
+];
+const modelStopTokens = new Map<string, string[]>();
+
 interface CacheEntry {
   modelMaxCtx: number;
   vision: boolean;
@@ -66,6 +81,12 @@ interface CacheEntry {
   eosToken?: string | number;
   quantization?: string;
   genMaxNewTokens?: number;
+  // TODO(future): split modality flags once pi supports more than text/image.
+  //   audio?: boolean;  // tokenizer_config.audio_token / chat_template audio ids
+  //   video?: boolean;  // tokenizer_config.video_token / chat_template video ids
+  // Detect via VISION/audio/video token keys + template ids; pi `input` only
+  // accepts "text" | "image" today, so these would be metadata-only until pi
+  // extends the model `input` union.
 }
 
 interface ModelMeta {
@@ -411,6 +432,10 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const ctx = effectiveCtx > 0 ? effectiveCtx : meta.modelMaxCtx;
       const maxTokens = Math.min(ctx, maxOut);
       const regId = resolveRepoId(id) ?? id;
+      // Collect this model's stop tokens for the message_end trim hook.
+      const stops = new Set<string>(STOP_TOKENS);
+      if (typeof meta.eosToken === "string") stops.add(meta.eosToken);
+      modelStopTokens.set(regId, [...stops]);
       const baseCompat = {
         supportsDeveloperRole: false as const,
         supportsReasoningEffort: false as const,
@@ -452,6 +477,38 @@ async function discoverAndRegister(pi: ExtensionAPI) {
 
 export default async function (pi: ExtensionAPI) {
   await discoverAndRegister(pi);
+
+  // Trim trailing leaked stop tokens from finalized assistant messages for our
+  // models only. mlxcel-server normally stops at EOS, but some quantized/small
+  // models emit the template's stop token at the end of the content.
+  pi.on("message_end", async (event, ctx) => {
+    const msg = event.message;
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) return;
+    const provider = (msg as any).provider ?? ctx.model?.provider;
+    if (!provider || !String(provider).startsWith("mlxcel-auto")) return;
+    const stops = modelStopTokens.get((msg as any).model);
+    if (!stops || stops.length === 0) return;
+    let changed = false;
+    const content = msg.content.map((block: any) => {
+      if (block?.type !== "text" || typeof block.text !== "string") return block;
+      let text = block.text;
+      let prev: string;
+      do {
+        prev = text;
+        text = text.replace(/\s+$/, "");
+        for (const s of stops) {
+          if (text.endsWith(s)) {
+            text = text.slice(0, -s.length);
+            break;
+          }
+        }
+      } while (text !== prev);
+      if (text === block.text) return block;
+      changed = true;
+      return { ...block, text };
+    });
+    return changed ? { message: { ...msg, content } } : undefined;
+  });
 
   pi.on("session_start", async (_e, ctx) => {
     if (ctx.hasUI) {
