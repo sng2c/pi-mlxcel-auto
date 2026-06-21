@@ -324,7 +324,7 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const maxTokens = Math.min(ctx, maxOut);
       regModels.push({
         id,
-        name: id.split("/").pop() ?? id,
+        name: resolveRepoId(id) ?? id.split("/").pop() ?? id,
         reasoning: meta.reasoning,
         input: meta.vision ? (["text", "image"] as const) : (["text"] as const),
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
