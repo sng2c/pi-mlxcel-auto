@@ -9,12 +9,23 @@
  * model store. Falls back to fetching Hugging Face config.json if the model
  * is not in the local store. Results are cached to avoid repeated work.
  *
+ * Beyond context, it also detects:
+ *   - reasoning/thinking: from chat_template tokens (enable_thinking /
+ *     reasoning_content / <think>...</think>). Sets `reasoning: true` and
+ *     `compat.thinkingFormat: "qwen-chat-template"` so pi drives MLX's
+ *     `chat_template_kwargs.enable_thinking` (off disables, others enable).
+ *   - vision: from `vision_config` or tokenizer image/video tokens. Sets
+ *     `input: ["text","image"]`.
+ *   - tools: from chat_template tool_call markers or `tool_parser_type`.
+ *     Informational only (pi has no per-model tool toggle); cached as metadata.
+ *
  * Config (env vars):
  *   MLXCEL_AUTO_PORTS  comma-separated ports to probe (default: "8080")
  *   MLXCEL_AUTO_HOST   host to probe (default: "127.0.0.1")
  *   MLXCEL_AUTO_APIKEY api key sent to the server (default: "not-needed")
  *   MLXCEL_AUTO_MAXOUT cap on maxTokens (default: 32768)
  *   MLXCEL_AUTO_FALLBACK_CTX  context window used when detection fails (default: 32768)
+ *   MLXCEL_AUTO_NO_REASONING  "1" disables automatic reasoning detection
  *   MLXCEL_AUTO_NO_CACHE  "1" disables the on-disk config cache
  *
  * No changes to pi core, models.json, or other extensions. Registers a
@@ -44,8 +55,17 @@ type Cfg = Record<string, any> | null;
 interface CacheEntry {
   contextWindow: number;
   vision: boolean;
+  reasoning: boolean;
+  tools: boolean;
   source: "local" | "hf" | "fallback";
   ts: number;
+}
+
+interface ModelMeta {
+  cfg: Cfg;
+  tokCfg: Cfg;        // tokenizer_config.json (may be null)
+  template: string;   // chat template text (jinja file or embedded string)
+  source: CacheEntry["source"];
 }
 type Cache = Record<string, CacheEntry>;
 
@@ -74,7 +94,7 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
   }
 }
 
-// --- local config.json resolution -------------------------------------------
+// --- local model dir resolution --------------------------------------------
 
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
 // mlxcel resolves a bare name (no slash) as `${MLXCEL_DEFAULT_ORG}/<name>`.
@@ -82,7 +102,6 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
 // mapped to a Hugging Face repo id.
 function resolveRepoId(modelId: string): string | null {
   if (!modelId) return null;
-  // Local path passed as -m (absolute or relative).
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
     return null;
   }
@@ -91,14 +110,12 @@ function resolveRepoId(modelId: string): string | null {
   return `${org}/${modelId}`;
 }
 
-function localConfigPath(modelId: string): string | null {
+function localModelDir(modelId: string): string | null {
   // Local directory path passed as -m?
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
     const maybeDir = modelId.startsWith("/") ? modelId : join(process.cwd(), modelId);
-    const cfg = join(maybeDir, "config.json");
-    if (existsSync(cfg)) return cfg;
+    if (existsSync(join(maybeDir, "config.json"))) return maybeDir;
   }
-  // Repo id owner/name: check MLXCEL_MODELS_DIR then the default mlxcel store.
   const repoId = resolveRepoId(modelId);
   if (!repoId) return null;
   const parts = repoId.split("/");
@@ -110,29 +127,89 @@ function localConfigPath(modelId: string): string | null {
   const cacheDir = process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`;
   dirs.push(join(cacheDir, "models", owner, name));
   for (const d of dirs) {
-    const cfg = join(d, "config.json");
-    if (existsSync(cfg)) return cfg;
+    if (existsSync(join(d, "config.json"))) return d;
   }
   return null;
 }
 
-async function loadConfig(modelId: string): Promise<{ cfg: Cfg; source: CacheEntry["source"] } | null> {
-  // 1) local store
-  const local = localConfigPath(modelId);
-  if (local) {
-    try {
-      return { cfg: JSON.parse(readFileSync(local, "utf8")), source: "local" };
-    } catch {}
+function readJsonFile(path: string): any | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
   }
-  // 2) Hugging Face config.json (resolved to owner/name for bare names)
-  const repoId = resolveRepoId(modelId);
-  const hfUrl = repoId
-    ? `https://huggingface.co/${repoId}/raw/main/config.json`
-    : null;
-  const hf = hfUrl ? await fetchJson(hfUrl, HTTP_TIMEOUT_MS) : null;
-  if (hf && typeof hf === "object") return { cfg: hf as Cfg, source: "hf" };
-  return null;
 }
+
+function readTextFile(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// Extract the chat template text from tokenizer_config.json (string or
+// list-of-templates) or from a sibling chat_template.jinja/.json file.
+function extractTemplate(tokCfg: Cfg, dir: string | null): string {
+  if (tokCfg) {
+    const ct = (tokCfg as any).chat_template;
+    if (typeof ct === "string") return ct;
+    if (Array.isArray(ct)) {
+      const parts = ct
+        .map((x) => (x && typeof x === "object" ? (x as any).template : x))
+        .filter((x) => typeof x === "string");
+      if (parts.length) return parts.join("\n");
+    }
+  }
+  if (dir) {
+    for (const f of ["chat_template.jinja", "chat_template.json"]) {
+      const t = readTextFile(join(dir, f));
+      if (t) return t;
+    }
+  }
+  return "";
+}
+
+async function fetchText(url: string, timeoutMs: number): Promise<string | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
+  // 1) local store
+  const dir = localModelDir(modelId);
+  if (dir) {
+    const cfg = readJsonFile(join(dir, "config.json"));
+    if (cfg && typeof cfg === "object") {
+      const tokCfg = readJsonFile(join(dir, "tokenizer_config.json"));
+      const template = extractTemplate(tokCfg, dir);
+      return { cfg, tokCfg, template, source: "local" };
+    }
+  }
+  // 2) Hugging Face config + tokenizer_config + chat_template.jinja
+  const repoId = resolveRepoId(modelId);
+  if (!repoId) return null;
+  const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
+  if (!cfg || typeof cfg !== "object") return null;
+  const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
+  let template = extractTemplate(tokCfg, null);
+  if (!template) {
+    const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
+    if (jinja) template = jinja;
+  }
+  return { cfg, tokCfg, template, source: "hf" };
+}
+
+// --- detection -------------------------------------------------------------
 
 function extractContext(cfg: Cfg): number | undefined {
   if (!cfg) return undefined;
@@ -144,10 +221,27 @@ function extractContext(cfg: Cfg): number | undefined {
   return undefined;
 }
 
-function isVision(cfg: Cfg): boolean {
-  if (!cfg) return false;
-  const v = cfg.vision_config;
-  return v != null && typeof v === "object" && Object.keys(v).length > 0;
+function isVision(cfg: Cfg, tokCfg: Cfg): boolean {
+  if (cfg) {
+    const v = cfg.vision_config;
+    if (v && typeof v === "object" && Object.keys(v).length > 0) return true;
+  }
+  if (tokCfg) {
+    const keys = ["image_token", "video_token", "boi_token", "eoi_token", "vision_bos_token", "vision_eos_token"];
+    for (const k of keys) if (tokCfg[k] != null) return true;
+  }
+  return false;
+}
+
+function detectReasoning(_cfg: Cfg, _tokCfg: Cfg, template: string): boolean {
+  if (env("MLXCEL_AUTO_NO_REASONING", "") === "1") return false;
+  return /enable_thinking|reasoning_content|<think|<\/think/.test(template || "");
+}
+
+function detectTools(_cfg: Cfg, tokCfg: Cfg, template: string): boolean {
+  if (tokCfg && tokCfg.tool_parser_type) return true;
+  const t = template || "";
+  return /tool_call|function_call/.test(t) && /tools/.test(t);
 }
 
 // --- cache ------------------------------------------------------------------
@@ -179,18 +273,22 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
   const cached = cache[modelId];
   if (cached) return cached;
 
-  const loaded = await loadConfig(modelId);
+  const meta = await loadModelMeta(modelId);
   const fbCtx = envInt("MLXCEL_AUTO_FALLBACK_CTX", 32768);
-  if (!loaded) {
-    const entry: CacheEntry = { contextWindow: fbCtx, vision: false, source: "fallback", ts: Date.now() };
+  if (!meta) {
+    const entry: CacheEntry = {
+      contextWindow: fbCtx, vision: false, reasoning: false, tools: false,
+      source: "fallback", ts: Date.now(),
+    };
     cache[modelId] = entry;
     return entry;
   }
-  const ctx = extractContext(loaded.cfg) ?? fbCtx;
   const entry: CacheEntry = {
-    contextWindow: ctx,
-    vision: isVision(loaded.cfg),
-    source: loaded.source,
+    contextWindow: extractContext(meta.cfg) ?? fbCtx,
+    vision: isVision(meta.cfg, meta.tokCfg),
+    reasoning: detectReasoning(meta.cfg, meta.tokCfg, meta.template),
+    tools: detectTools(meta.cfg, meta.tokCfg, meta.template),
+    source: meta.source,
     ts: Date.now(),
   };
   cache[modelId] = entry;
@@ -227,11 +325,12 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       regModels.push({
         id,
         name: id.split("/").pop() ?? id,
-        reasoning: false,
+        reasoning: meta.reasoning,
         input: meta.vision ? (["text", "image"] as const) : (["text"] as const),
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: ctx,
         maxTokens,
+        ...(meta.reasoning ? { compat: { thinkingFormat: "qwen-chat-template" as const } } : {}),
       });
       registered++;
     }
