@@ -1,6 +1,6 @@
 {
   "name": "pi-mlxcel-auto",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Auto-discover running mlxcel-server (OpenAI-compatible) on localhost, read each model's real context window from the local MLX store config.json, and register it with pi. No manual ctx-size entry.",
   "license": "MIT",
   "author": "sng2c",
@@ -11,6 +11,9 @@
   },
   "pi": {
     "extensions": ["./extensions"]
+  },
+  "dependencies": {
+    "@huggingface/jinja": "^0.5.9"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

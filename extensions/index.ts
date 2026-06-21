@@ -33,6 +33,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { tokenize } from "@huggingface/jinja";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -59,11 +60,18 @@ interface CacheEntry {
   tools: boolean;
   source: "local" | "hf" | "fallback";
   ts: number;
+  // Informational metadata from HF config docs (not used in registration).
+  modelType?: string;
+  architectures?: string[];
+  eosToken?: string | number;
+  quantization?: string;
+  genMaxNewTokens?: number;
 }
 
 interface ModelMeta {
   cfg: Cfg;
   tokCfg: Cfg;        // tokenizer_config.json (may be null)
+  genCfg: Cfg;        // generation_config.json (may be null)
   template: string;   // chat template text (jinja file or embedded string)
   source: CacheEntry["source"];
 }
@@ -191,25 +199,46 @@ async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
     const cfg = readJsonFile(join(dir, "config.json"));
     if (cfg && typeof cfg === "object") {
       const tokCfg = readJsonFile(join(dir, "tokenizer_config.json"));
+      const genCfg = readJsonFile(join(dir, "generation_config.json"));
       const template = extractTemplate(tokCfg, dir);
-      return { cfg, tokCfg, template, source: "local" };
+      return { cfg, tokCfg, genCfg, template, source: "local" };
     }
   }
-  // 2) Hugging Face config + tokenizer_config + chat_template.jinja
+  // 2) Hugging Face config + tokenizer_config + generation_config + chat_template.jinja
   const repoId = resolveRepoId(modelId);
   if (!repoId) return null;
   const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
   if (!cfg || typeof cfg !== "object") return null;
   const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
+  const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
   let template = extractTemplate(tokCfg, null);
   if (!template) {
     const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
     if (jinja) template = jinja;
   }
-  return { cfg, tokCfg, template, source: "hf" };
+  return { cfg, tokCfg, genCfg, template, source: "hf" };
 }
 
 // --- detection -------------------------------------------------------------
+
+// Lex the Jinja chat template and collect identifier-like tokens. HF's own
+// @huggingface/jinja tokenizer is more robust than regex: it distinguishes
+// real identifiers from string literals/comments, and exposes template
+// variables (enable_thinking, tools, tool_call, image, ...). Returns null if
+// the lexer cannot handle the template (caller falls back to regex).
+function templateIdentifiers(template: string): Set<string> | null {
+  if (!template) return null;
+  try {
+    const ids = new Set<string>();
+    for (const tk of tokenize(template)) {
+      const v = tk?.value;
+      if (typeof v === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) ids.add(v);
+    }
+    return ids;
+  } catch {
+    return null;
+  }
+}
 
 function extractContext(cfg: Cfg): number | undefined {
   if (!cfg) return undefined;
@@ -221,27 +250,45 @@ function extractContext(cfg: Cfg): number | undefined {
   return undefined;
 }
 
-function isVision(cfg: Cfg, tokCfg: Cfg): boolean {
+const VISION_TOK_KEYS = ["image_token", "video_token", "boi_token", "eoi_token", "vision_bos_token", "vision_eos_token"];
+const VISION_TEMPLATE_IDS = ["image", "image_url", "image_count", "video", "video_count", "vision", "add_vision_id", "do_vision_count"];
+
+function isVision(cfg: Cfg, tokCfg: Cfg, ids: Set<string> | null): boolean {
   if (cfg) {
     const v = cfg.vision_config;
     if (v && typeof v === "object" && Object.keys(v).length > 0) return true;
   }
   if (tokCfg) {
-    const keys = ["image_token", "video_token", "boi_token", "eoi_token", "vision_bos_token", "vision_eos_token"];
-    for (const k of keys) if (tokCfg[k] != null) return true;
+    for (const k of VISION_TOK_KEYS) if (tokCfg[k] != null) return true;
+  }
+  if (ids) {
+    for (const k of VISION_TEMPLATE_IDS) if (ids.has(k)) return true;
   }
   return false;
 }
 
-function detectReasoning(_cfg: Cfg, _tokCfg: Cfg, template: string): boolean {
+const REASONING_IDS = ["enable_thinking", "reasoning_content", "clear_thinking", "think", "reasoning"];
+
+function detectReasoning(ids: Set<string> | null, template: string): boolean {
   if (env("MLXCEL_AUTO_NO_REASONING", "") === "1") return false;
-  return /enable_thinking|reasoning_content|<think|<\/think/.test(template || "");
+  if (ids) {
+    for (const k of REASONING_IDS) if (ids.has(k)) return true;
+    return false;
+  }
+  return /enable_thinking|reasoning_content|clear_thinking|<think|<\/think/.test(template || "");
 }
 
-function detectTools(_cfg: Cfg, tokCfg: Cfg, template: string): boolean {
+function detectTools(tokCfg: Cfg, ids: Set<string> | null, template: string): boolean {
   if (tokCfg && tokCfg.tool_parser_type) return true;
-  const t = template || "";
-  return /tool_call|function_call/.test(t) && /tools/.test(t);
+  if (ids) {
+    if (ids.has("tools")) {
+      for (const k of ["tool_call", "tool_calls", "tool", "function_call", "function"]) {
+        if (ids.has(k)) return true;
+      }
+    }
+    return false;
+  }
+  return /tool_call|function_call/.test(template || "") && /tools/.test(template || "");
 }
 
 // --- cache ------------------------------------------------------------------
@@ -289,13 +336,29 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
     cache[modelId] = entry;
     return entry;
   }
+  const ids = templateIdentifiers(meta.template);
+  const ctx =
+    extractContext(meta.cfg) ??
+    (meta.tokCfg && Number.isFinite(meta.tokCfg.model_max_length) ? meta.tokCfg.model_max_length : undefined) ??
+    fbCtx;
+  const modelType = meta.cfg?.model_type ?? meta.cfg?.text_config?.model_type;
+  const architectures = Array.isArray(meta.cfg?.architectures) ? meta.cfg.architectures : undefined;
+  const eosToken = meta.cfg?.eos_token_id ?? meta.tokCfg?.eos_token;
+  const quantBits = meta.cfg?.quantization?.bits;
+  const quantization = quantBits != null ? `${quantBits}-bit` : (meta.cfg?.quantization?.group_size != null ? "quantized" : undefined);
+  const genMaxNewTokens = meta.genCfg?.max_new_tokens ?? meta.genCfg?.max_length;
   const entry: CacheEntry = {
-    modelMaxCtx: extractContext(meta.cfg) ?? fbCtx,
-    vision: isVision(meta.cfg, meta.tokCfg),
-    reasoning: detectReasoning(meta.cfg, meta.tokCfg, meta.template),
-    tools: detectTools(meta.cfg, meta.tokCfg, meta.template),
+    modelMaxCtx: ctx,
+    vision: isVision(meta.cfg, meta.tokCfg, ids),
+    reasoning: detectReasoning(ids, meta.template),
+    tools: detectTools(meta.tokCfg, ids, meta.template),
     source: meta.source,
     ts: Date.now(),
+    modelType,
+    architectures,
+    eosToken,
+    quantization,
+    genMaxNewTokens,
   };
   cache[modelId] = entry;
   return entry;
@@ -351,6 +414,8 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const baseCompat = {
         supportsDeveloperRole: false as const,
         supportsReasoningEffort: false as const,
+        supportsStore: false as const,
+        supportsStrictMode: false as const,
         maxTokensField: "max_tokens" as const,
       };
       regModels.push({
