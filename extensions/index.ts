@@ -62,9 +62,6 @@ const STOP_TOKENS = [
   "<|endoftext|>",
   "<end_of_turn>",
   "<start_of_turn>",
-  "",
-  "",
-  "",
 ];
 const modelStopTokens = new Map<string, string[]>();
 
@@ -497,6 +494,7 @@ export default async function (pi: ExtensionAPI) {
         prev = text;
         text = text.replace(/\s+$/, "");
         for (const s of stops) {
+          if (!s) continue;
           if (text.endsWith(s)) {
             text = text.slice(0, -s.length);
             break;
