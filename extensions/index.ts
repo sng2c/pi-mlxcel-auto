@@ -323,6 +323,11 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const ctx = meta.contextWindow;
       const maxTokens = Math.min(ctx, maxOut);
       const regId = resolveRepoId(id) ?? id;
+      const baseCompat = {
+        supportsDeveloperRole: false as const,
+        supportsReasoningEffort: false as const,
+        maxTokensField: "max_tokens" as const,
+      };
       regModels.push({
         id: regId,
         name: id.split("/").pop() ?? id,
@@ -331,7 +336,9 @@ async function discoverAndRegister(pi: ExtensionAPI) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: ctx,
         maxTokens,
-        ...(meta.reasoning ? { compat: { thinkingFormat: "qwen-chat-template" as const } } : {}),
+        compat: meta.reasoning
+          ? { ...baseCompat, thinkingFormat: "qwen-chat-template" as const }
+          : baseCompat,
       });
       registered++;
     }
@@ -343,11 +350,6 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       baseUrl: `http://${host}:${port}/v1`,
       apiKey,
       api: "openai-completions",
-      compat: {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: false,
-        maxTokensField: "max_tokens",
-      },
       models: regModels,
     });
   }
