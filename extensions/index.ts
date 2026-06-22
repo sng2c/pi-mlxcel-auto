@@ -20,17 +20,17 @@
  *     Informational only (pi has no per-model tool toggle); cached as metadata.
  *
  * Config (env vars):
- *   MLXCEL_AUTO_PORTS  comma-separated ports to probe (default: "8080")
- *   MLXCEL_AUTO_HOST   host to probe (default: "127.0.0.1")
- *   MLXCEL_AUTO_SCHEME  URL scheme for the server (default: "http")
- *   MLXCEL_AUTO_APIKEY api key sent to the server (default: "not-needed")
- *   MLXCEL_AUTO_MAXOUT cap on maxTokens (default: 32768)
+ *   MLXCEL_AUTO_BASEURLS  comma-separated server base URLs (default: "http://127.0.0.1:8080")
+ *                         e.g. "http://127.0.0.1:8080,https://remote.example.com:8443"
+ *   MLXCEL_AUTO_APIKEY    api key sent to the server (default: "not-needed")
+ *   MLXCEL_AUTO_MAXOUT    cap on maxTokens (default: 32768)
  *   MLXCEL_AUTO_FALLBACK_CTX  context window used when detection fails (default: 32768)
  *   MLXCEL_AUTO_NO_REASONING  "1" disables automatic reasoning detection
  *   MLXCEL_AUTO_NO_CACHE  "1" disables the on-disk config cache
  *
  * No changes to pi core, models.json, or other extensions. Registers a
- * provider per port as "mlxcel-auto" (port 8080) or "mlxcel-auto-<port>".
+ * provider per base URL; the provider id is "mlxcel-auto" for the default
+ * (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -337,8 +337,39 @@ function saveCache(c: Cache) {
 
 // --- discovery + registration ----------------------------------------------
 
-async function probePort(scheme: string, host: string, port: number): Promise<any[] | null> {
-  const data = await fetchJson(`${scheme}://${host}:${port}/v1/models`, PROBE_TIMEOUT_MS);
+interface ServerUrl {
+  origin: string;   // e.g. "http://127.0.0.1:8080"
+  baseUrl: string;  // e.g. "http://127.0.0.1:8080/v1"
+  host: string;
+  port: number;
+}
+
+function parseBaseUrls(raw: string): ServerUrl[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      // tolerate missing scheme
+      const url = s.includes("://") ? s : `http://${s}`;
+      const u = new URL(url.endsWith("/") ? url : url + "/");
+      const origin = u.origin;
+      const baseUrl = `${origin}/v1`;
+      const host = u.hostname;
+      const port = u.port ? Number(u.port) : (u.protocol === "https:" ? 443 : 80);
+      return { origin, baseUrl, host, port };
+    });
+}
+
+function providerIdFrom(url: ServerUrl): string {
+  const isDefault =
+    (url.origin === "http://127.0.0.1:8080" || url.origin === "http://localhost:8080");
+  if (isDefault) return "mlxcel-auto";
+  return `mlxcel-auto-${url.host}-${url.port}`;
+}
+
+async function probeServer(origin: string): Promise<any[] | null> {
+  const data = await fetchJson(`${origin}/v1/models`, PROBE_TIMEOUT_MS);
   if (!data || !Array.isArray(data.data)) return null;
   return data.data as any[];
 }
@@ -396,10 +427,10 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
 // reports 0, meaning unbounded up to model max, so the caller keeps the model
 // max. With an explicit `--ctx-size C --parallel N`, it reports floor(C / N),
 // the real per-slot budget, which should override.
-async function fetchEffectiveCtx(scheme: string, host: string, port: number): Promise<number> {
-  const h = await fetchJson(`${scheme}://${host}:${port}/health`, PROBE_TIMEOUT_MS);
+async function fetchEffectiveCtx(origin: string): Promise<number> {
+  const h = await fetchJson(`${origin}/health`, PROBE_TIMEOUT_MS);
   if (h && Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
-  const slots = await fetchJson(`${scheme}://${host}:${port}/slots`, PROBE_TIMEOUT_MS);
+  const slots = await fetchJson(`${origin}/slots`, PROBE_TIMEOUT_MS);
   if (Array.isArray(slots)) {
     for (const s of slots) {
       const cs = s?.context_size;
@@ -410,12 +441,7 @@ async function fetchEffectiveCtx(scheme: string, host: string, port: number): Pr
 }
 
 async function discoverAndRegister(pi: ExtensionAPI) {
-  const scheme = env("MLXCEL_AUTO_SCHEME", "http");
-  const host = env("MLXCEL_AUTO_HOST", "127.0.0.1");
-  const ports = env("MLXCEL_AUTO_PORTS", "8080")
-    .split(",")
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0);
+  const servers = parseBaseUrls(env("MLXCEL_AUTO_BASEURLS", "http://127.0.0.1:8080"));
   const apiKey = env("MLXCEL_AUTO_APIKEY", "not-needed");
   const maxOut = envInt("MLXCEL_AUTO_MAXOUT", 32768);
 
@@ -423,14 +449,14 @@ async function discoverAndRegister(pi: ExtensionAPI) {
   let registered = 0;
   const failures: string[] = [];
 
-  for (const port of ports) {
-    const models = await probePort(scheme, host, port);
+  for (const srv of servers) {
+    const models = await probeServer(srv.origin);
     if (models === null) {
-      failures.push(`${scheme}://${host}:${port} not reachable`);
+      failures.push(`${srv.origin} not reachable`);
       continue;
     }
-    const providerId = port === 8080 ? "mlxcel-auto" : `mlxcel-auto-${port}`;
-    const effectiveCtx = await fetchEffectiveCtx(scheme, host, port);
+    const providerId = providerIdFrom(srv);
+    const effectiveCtx = await fetchEffectiveCtx(srv.origin);
     const regModels = [];
     for (const m of models) {
       const id: string = m.id ?? m.model ?? "";
@@ -471,11 +497,11 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       registered++;
     }
     if (regModels.length === 0) {
-      failures.push(`${host}:${port} returned no models`);
+      failures.push(`${srv.origin} returned no models`);
       continue;
     }
     pi.registerProvider(providerId, {
-      baseUrl: `${scheme}://${host}:${port}/v1`,
+      baseUrl: srv.baseUrl,
       apiKey,
       api: "openai-completions",
       models: regModels,
