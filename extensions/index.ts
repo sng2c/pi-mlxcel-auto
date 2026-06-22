@@ -163,10 +163,67 @@ async function searchHfModel(bareName: string): Promise<string | null> {
   return null;
 }
 
-// Find a local model directory by scanning for the model name, org-agnostic.
-// Searches: 1) explicit MLXCEL_MODELS_DIR, 2) mlxcel store, 3) HF hub cache.
-// For stores with an org/ directory structure, scans all orgs for a matching name.
-// For the HF hub cache, scans models--*--<name> patterns.
+// A local model store that can be searched by model name.
+interface ModelStore {
+  // Human-readable label for debug logs.
+  label: string;
+  // Find config.json for the given model name. Return the directory or null.
+  find(name: string, knownOwner: string | null): string | null;
+}
+
+// mlxcel store layout: <base>/models/<owner>/<name>/config.json
+const mlxcelStore = (base: string): ModelStore => ({
+  label: "mlxcel",
+  find(name: string, knownOwner: string | null): string | null {
+    const modelsDir = join(base, "models");
+    if (!existsSync(modelsDir)) return null;
+    // Exact owner path first if known
+    if (knownOwner) {
+      const d = join(modelsDir, knownOwner, name);
+      if (existsSync(join(d, "config.json"))) return d;
+    }
+    // Scan all orgs
+    try {
+      for (const entry of readdirSync(modelsDir)) {
+        const d = join(modelsDir, entry, name);
+        if (existsSync(join(d, "config.json"))) return d;
+      }
+    } catch {}
+    return null;
+  },
+});
+
+// HF hub cache layout: <base>/models--<owner>--<name>/snapshots/<hash>/config.json
+const hfHubStore = (base: string): ModelStore => ({
+  label: "hf-hub",
+  find(name: string, _knownOwner: string | null): string | null {
+    if (!existsSync(base)) return null;
+    const suffix = `--${name}`;
+    try {
+      for (const entry of readdirSync(base)) {
+        if (entry.startsWith("models--") && entry.endsWith(suffix)) {
+          const snapshotsDir = join(base, entry, "snapshots");
+          try {
+            const commits = readdirSync(snapshotsDir).sort();
+            const latest = commits[commits.length - 1];
+            if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
+              return join(snapshotsDir, latest);
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+    return null;
+  },
+});
+
+// Resolve the HF hub cache base directory.
+function hfHubBase(): string {
+  if (process.env.HF_HUB_CACHE) return process.env.HF_HUB_CACHE;
+  if (process.env.HF_HOME) return join(process.env.HF_HOME, "hub");
+  return `${homedir()}/.cache/huggingface/hub`;
+}
+
 function localModelDir(modelId: string): string | null {
   // Local directory path passed as -m?
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
@@ -174,64 +231,21 @@ function localModelDir(modelId: string): string | null {
     if (existsSync(join(maybeDir, "config.json"))) return maybeDir;
   }
 
-  // Determine name (after "/") and a candidate owner for exact-match paths.
   const slashIdx = modelId.indexOf("/");
   const name = slashIdx >= 0 ? modelId.slice(slashIdx + 1) : modelId;
   const knownOwner = slashIdx >= 0 ? modelId.slice(0, slashIdx) : null;
 
-  const candidates: string[] = [];
+  // Stores to search, in priority order.
+  const stores: ModelStore[] = [
+    // Explicit overrides first
+    ...(process.env.MLXCEL_MODELS_DIR ? [mlxcelStore(process.env.MLXCEL_MODELS_DIR)] : []),
+    mlxcelStore(process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`),
+    hfHubStore(hfHubBase()),
+  ];
 
-  // 1) Explicit override (uses known owner or MLXCEL_DEFAULT_ORG)
-  const md = process.env.MLXCEL_MODELS_DIR;
-  if (md) {
-    if (knownOwner) {
-      candidates.push(join(md, knownOwner, name));
-    } else {
-      const org = env("MLXCEL_DEFAULT_ORG", "mlx-community");
-      candidates.push(join(md, org, name));
-    }
-  }
-
-  // 2) mlxcel store: scan all org dirs for a matching model name
-  const cacheDir = process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`;
-  const mlxcelModels = join(cacheDir, "models");
-  if (existsSync(mlxcelModels)) {
-    try {
-      for (const entry of readdirSync(mlxcelModels)) {
-        const candidate = join(mlxcelModels, entry, name);
-        if (existsSync(join(candidate, "config.json"))) {
-          candidates.push(candidate);
-        }
-      }
-    } catch {}
-  }
-
-  // 3) HF hub cache: scan models--*--<name> patterns
-  const hfCacheDir = process.env.HF_HUB_CACHE || process.env.HF_HOME
-    ? join(process.env.HF_HUB_CACHE || process.env.HF_HOME!, "hub")
-    : `${homedir()}/.cache/huggingface/hub`;
-  const hfModelsPrefix = `models--`;
-  const hfNamePattern = `--${name}`;
-  if (existsSync(hfCacheDir)) {
-    try {
-      for (const entry of readdirSync(hfCacheDir)) {
-        if (entry.startsWith(hfModelsPrefix) && entry.endsWith(hfNamePattern)) {
-          const snapshotsDir = join(hfCacheDir, entry, "snapshots");
-          try {
-            const commits = readdirSync(snapshotsDir).sort();
-            const latest = commits[commits.length - 1];
-            if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
-              candidates.push(join(snapshotsDir, latest));
-            }
-          } catch {}
-        }
-      }
-    } catch {}
-  }
-
-  // Return the first candidate with config.json (prioritize exact match)
-  for (const d of candidates) {
-    if (existsSync(join(d, "config.json"))) return d;
+  for (const store of stores) {
+    const found = store.find(name, knownOwner);
+    if (found) return found;
   }
   return null;
 }
