@@ -1,36 +1,40 @@
 /**
  * mlxcel-auto
  *
- * Auto-discovers a running `mlxcel-server` (OpenAI-compatible) on localhost,
- * reads each model's real max context window from the local MLX store's
- * config.json (no manual ctx-size entry), and registers it with pi.
+ * Auto-discovers a running `mlxcel-server` (OpenAI-compatible) and registers
+ * its served models with pi, reading each model's real context window from
+ * config.json so you never type ctx-size manually. Supports http and https,
+ * local and remote servers.
  *
- * Local-first: reads `<store>/<owner>/<name>/config.json` from the mlxcel
- * model store. Falls back to fetching Hugging Face config.json if the model
- * is not in the local store. Results are cached to avoid repeated work.
+ * Metadata source is remote-first (Hugging Face), falling back to the local
+ * mlxcel model store when HF is unreachable, the model is gated/private, or
+ * the id is a local path. Results are cached.
  *
- * Beyond context, it also detects:
+ * Beyond context, also detects:
  *   - reasoning/thinking: from chat_template tokens (enable_thinking /
- *     reasoning_content / <think>...</think>). Sets `reasoning: true` and
+ *     reasoning_content / clear_thinking / think). Sets `reasoning: true` and
  *     `compat.thinkingFormat: "qwen-chat-template"` so pi drives MLX's
  *     `chat_template_kwargs.enable_thinking` (off disables, others enable).
  *   - vision: from `vision_config` or tokenizer image/video tokens. Sets
  *     `input: ["text","image"]`.
- *   - tools: from chat_template tool_call markers or `tool_parser_type`.
+ *   - tools: from chat template tool-call markers or `tool_parser_type`.
  *     Informational only (pi has no per-model tool toggle); cached as metadata.
  *
  * Config (env vars):
- *   MLXCEL_AUTO_BASEURLS  comma-separated server base URLs (default: "http://127.0.0.1:8080")
- *                         e.g. "http://127.0.0.1:8080,https://remote.example.com:8443"
- *   MLXCEL_AUTO_APIKEY    api key sent to the server (default: "not-needed")
- *   MLXCEL_AUTO_MAXOUT    cap on maxTokens (default: 32768)
- *   MLXCEL_AUTO_FALLBACK_CTX  context window used when detection fails (default: 32768)
- *   MLXCEL_AUTO_NO_REASONING  "1" disables automatic reasoning detection
- *   MLXCEL_AUTO_NO_CACHE  "1" disables the on-disk config cache
+ *   MLXCEL_AUTO_BASEURLS       comma-separated server base URLs (default: "http://127.0.0.1:8080")
+ *                              e.g. "http://127.0.0.1:8080,https://remote.example.com:8443"
+ *                              Scheme is optional (defaults to http).
+ *   MLXCEL_AUTO_APIKEY         api key sent to the server (default: "not-needed")
+ *   MLXCEL_AUTO_MAXOUT         cap on maxTokens (default: 32768)
+ *   MLXCEL_AUTO_FALLBACK_CTX   context window when detection fails (default: 32768)
+ *   MLXCEL_AUTO_NO_REASONING   "1" disables automatic reasoning detection
+ *   MLXCEL_AUTO_NO_CACHE        "1" disables the on-disk config cache
+ *   MLXCEL_DEFAULT_ORG         org for bare model names (default: "mlx-community")
+ *   MLXCEL_MODELS_DIR           override mlxcel model-store root (default: unset)
+ *   MLXCEL_CACHE_DIR            override mlxcel cache root (default: "~/.cache/mlxcel")
  *
- * No changes to pi core, models.json, or other extensions. Registers a
- * provider per base URL; the provider id is "mlxcel-auto" for the default
- * (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
+ * Registers a provider per base URL; the provider id is "mlxcel-auto" for the
+ * default (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -60,7 +64,7 @@ type Cfg = Record<string, any> | null;
 const STOP_TOKENS = [
   "<|im_end|>",
   "<|endofsentext|>",
-  "<|endoftext|>",
+  "",
   "<end_of_turn>",
   "<start_of_turn>",
 ];
@@ -126,11 +130,9 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
 // mlxcel-server returns bare snapshot names (e.g. "gemma-3-4b-it-qat-4bit")
 // even when launched with a full repo id ("mlx-community/gemma-3-4b-it-qat-4bit").
-// We try the server's /v1/models response id first; if it's already owner/name we
-// use it as-is. Otherwise we need an org to construct the HF URL. The default is
-// "mlx-community" because that's where most MLX-quantized models live, but it's
-// configurable via MLXCEL_DEFAULT_ORG for other orgs. If the guess is wrong, HF
-// returns 404 and we fall back to the local model store — so it's never fatal.
+// Bare names are resolved as MLXCEL_DEFAULT_ORG/<name> (default "mlx-community").
+// If the guess is wrong, HF returns 404 and we fall back to the local model
+// store — so it's never fatal.
 function resolveRepoId(modelId: string): string | null {
   if (!modelId) return null;
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
