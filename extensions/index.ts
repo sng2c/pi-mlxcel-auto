@@ -79,6 +79,16 @@ interface ModelMeta {
 }
 type Cache = Record<string, CacheEntry>;
 
+// TODO(future): build metadata from local model files when HF is unavailable
+//   (offline, gated/private, or removed from HF). Read config.json /
+//   tokenizer_config.json / chat_template.jinja from the mlxcel store
+//   (~/.cache/mlxcel/models/<owner>/<name>/) or the HF hub cache
+//   (~/.cache/huggingface/hub/models--<owner>--<name>/snapshots/<hash>/).
+//   This would let models that 404 on HF still get full detection instead of
+//   being skipped, and would work offline. The detection logic
+//   (extractContext, isVision, detectReasoning) is already source-agnostic —
+//   only the loader needs a local-file path alongside fetchHfMeta().
+
 function env(key: string, def: string): string {
   const v = process.env[key];
   return v && v.trim() ? v.trim() : def;
