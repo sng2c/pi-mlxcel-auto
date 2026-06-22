@@ -3,13 +3,13 @@
  *
  * Auto-discovers a running `mlxcel-server` (OpenAI-compatible) and registers
  * its served models with pi, reading each model's real context window from
- * config.json so you never type ctx-size manually. Supports http and https,
- * local and remote servers.
+ * Hugging Face metadata so you never type ctx-size manually. Supports http
+ * and https, local and remote servers. Works with any OpenAI-compatible MLX
+ * server (mlxcel, mlx-lm, etc.).
  *
- * Metadata source is remote-first (Hugging Face), falling back to the local
- * model store when HF is unreachable, the model is gated/private, or the id is
- * a local path. The local search covers both the mlxcel store and the Hugging
- * Face hub cache, so mlx-lm models are found as well. Results are cached.
+ * Metadata is fetched from Hugging Face (remote-only). Bare model names are
+ * resolved by trying MLXCEL_DEFAULT_ORG first, then the HF search API.
+ * Results are cached permanently — model metadata doesn't change.
  *
  * Beyond context, also detects:
  *   - reasoning/thinking: from chat_template tokens (enable_thinking /
@@ -18,22 +18,16 @@
  *     `chat_template_kwargs.enable_thinking` (off disables, others enable).
  *   - vision: from `vision_config` or tokenizer image/video tokens. Sets
  *     `input: ["text","image"]`.
- *   - tools: from chat template tool-call markers or `tool_parser_type`.
- *     Informational only (pi has no per-model tool toggle); cached as metadata.
  *
  * Config (env vars):
  *   MLXCEL_AUTO_BASEURLS       comma-separated server base URLs (default: "http://127.0.0.1:8080")
  *                              e.g. "http://127.0.0.1:8080,https://remote.example.com:8443"
  *                              Scheme is optional (defaults to http).
  *   MLXCEL_AUTO_APIKEY         api key sent to the server (default: "not-needed")
- *   MLXCEL_AUTO_MAXOUT         cap on maxTokens (default: 32768)
- *   MLXCEL_AUTO_FALLBACK_CTX   context window when detection fails (default: 32768)
+ *   MLXCEL_AUTO_MAXOUT         cap on maxTokens, also used as fallback context (default: 32768)
  *   MLXCEL_AUTO_NO_REASONING   "1" disables automatic reasoning detection
- *   MLXCEL_AUTO_NO_CACHE        "1" disables the on-disk config cache
+ *   MLXCEL_AUTO_NO_CACHE       "1" disables the on-disk config cache
  *   MLXCEL_DEFAULT_ORG         org for bare model names, tried first before HF search (default: "mlx-community")
- *   MLXCEL_MODELS_DIR           override mlxcel model-store root (default: unset)
- *   MLXCEL_CACHE_DIR            override mlxcel cache root (default: "~/.cache/mlxcel")
- *   HF_HUB_CACHE / HF_HOME      Hugging Face hub cache location (used for mlx-lm models)
  *
  * Registers a provider per base URL; the provider id is "mlxcel-auto" for the
  * default (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
@@ -41,8 +35,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { tokenize } from "@huggingface/jinja";
-import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 
 const CACHE_PATH = `${homedir()}/.pi/agent/extensions-data/mlxcel-auto-cache.json`;
@@ -76,29 +69,13 @@ interface CacheEntry {
   modelMaxCtx: number;
   vision: boolean;
   reasoning: boolean;
-  tools: boolean;
-  source: "local" | "hf" | "fallback";
-  ts: number;
-  // Informational metadata from HF config docs (not used in registration).
-  modelType?: string;
-  architectures?: string[];
   eosToken?: string | number;
-  quantization?: string;
-  genMaxNewTokens?: number;
-  // TODO(future): split modality flags once pi supports more than text/image.
-  //   audio?: boolean;  // tokenizer_config.audio_token / chat_template audio ids
-  //   video?: boolean;  // tokenizer_config.video_token / chat_template video ids
-  // Detect via VISION/audio/video token keys + template ids; pi `input` only
-  // accepts "text" | "image" today, so these would be metadata-only until pi
-  // extends the model `input` union.
 }
 
 interface ModelMeta {
   cfg: Cfg;
   tokCfg: Cfg;        // tokenizer_config.json (may be null)
-  genCfg: Cfg;        // generation_config.json (may be null)
   template: string;   // chat template text (jinja file or embedded string)
-  source: CacheEntry["source"];
 }
 type Cache = Record<string, CacheEntry>;
 
@@ -127,11 +104,24 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
   }
 }
 
-// --- local model dir resolution --------------------------------------------
+async function fetchText(url: string, timeoutMs: number): Promise<string | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// --- repo id resolution -----------------------------------------------------
 
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
 // - Full repo id (contains "/"): returned as-is.
-// - Local path (starts with "/", "./", "../"): null (not a HF repo).
 // - Bare name: resolved as MLXCEL_DEFAULT_ORG/<name> (default "mlx-community").
 //   If that HF URL returns 404, the caller falls back to the HF search API
 //   to find the correct org automatically.
@@ -163,112 +153,9 @@ async function searchHfModel(bareName: string): Promise<string | null> {
   return null;
 }
 
-// A local model store that can be searched by model name.
-interface ModelStore {
-  // Human-readable label for debug logs.
-  label: string;
-  // Find config.json for the given model name. Return the directory or null.
-  find(name: string, knownOwner: string | null): string | null;
-}
-
-// mlxcel store layout: <base>/models/<owner>/<name>/config.json
-const mlxcelStore = (base: string): ModelStore => ({
-  label: "mlxcel",
-  find(name: string, knownOwner: string | null): string | null {
-    const modelsDir = join(base, "models");
-    if (!existsSync(modelsDir)) return null;
-    // Exact owner path first if known
-    if (knownOwner) {
-      const d = join(modelsDir, knownOwner, name);
-      if (existsSync(join(d, "config.json"))) return d;
-    }
-    // Scan all orgs
-    try {
-      for (const entry of readdirSync(modelsDir)) {
-        const d = join(modelsDir, entry, name);
-        if (existsSync(join(d, "config.json"))) return d;
-      }
-    } catch {}
-    return null;
-  },
-});
-
-// HF hub cache layout: <base>/models--<owner>--<name>/snapshots/<hash>/config.json
-const hfHubStore = (base: string): ModelStore => ({
-  label: "hf-hub",
-  find(name: string, _knownOwner: string | null): string | null {
-    if (!existsSync(base)) return null;
-    const suffix = `--${name}`;
-    try {
-      for (const entry of readdirSync(base)) {
-        if (entry.startsWith("models--") && entry.endsWith(suffix)) {
-          const snapshotsDir = join(base, entry, "snapshots");
-          try {
-            const commits = readdirSync(snapshotsDir).sort();
-            const latest = commits[commits.length - 1];
-            if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
-              return join(snapshotsDir, latest);
-            }
-          } catch {}
-        }
-      }
-    } catch {}
-    return null;
-  },
-});
-
-// Resolve the HF hub cache base directory.
-function hfHubBase(): string {
-  if (process.env.HF_HUB_CACHE) return process.env.HF_HUB_CACHE;
-  if (process.env.HF_HOME) return join(process.env.HF_HOME, "hub");
-  return `${homedir()}/.cache/huggingface/hub`;
-}
-
-function localModelDir(modelId: string): string | null {
-  // Local directory path passed as -m?
-  if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
-    const maybeDir = modelId.startsWith("/") ? modelId : join(process.cwd(), modelId);
-    if (existsSync(join(maybeDir, "config.json"))) return maybeDir;
-  }
-
-  const slashIdx = modelId.indexOf("/");
-  const name = slashIdx >= 0 ? modelId.slice(slashIdx + 1) : modelId;
-  const knownOwner = slashIdx >= 0 ? modelId.slice(0, slashIdx) : null;
-
-  // Stores to search, in priority order.
-  const stores: ModelStore[] = [
-    // Explicit overrides first
-    ...(process.env.MLXCEL_MODELS_DIR ? [mlxcelStore(process.env.MLXCEL_MODELS_DIR)] : []),
-    mlxcelStore(process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`),
-    hfHubStore(hfHubBase()),
-  ];
-
-  for (const store of stores) {
-    const found = store.find(name, knownOwner);
-    if (found) return found;
-  }
-  return null;
-}
-
-function readJsonFile(path: string): any | null {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function readTextFile(path: string): string | null {
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-}
-
 // Extract the chat template text from tokenizer_config.json (string or
-// list-of-templates) or from a sibling chat_template.jinja/.json file.
-function extractTemplate(tokCfg: Cfg, dir: string | null): string {
+// list-of-templates) or from a sibling chat_template.jinja file.
+function extractTemplate(tokCfg: Cfg, repoId: string | null): string {
   if (tokCfg) {
     const ct = (tokCfg as any).chat_template;
     if (typeof ct === "string") return ct;
@@ -279,75 +166,47 @@ function extractTemplate(tokCfg: Cfg, dir: string | null): string {
       if (parts.length) return parts.join("\n");
     }
   }
-  if (dir) {
-    for (const f of ["chat_template.jinja", "chat_template.json"]) {
-      const t = readTextFile(join(dir, f));
-      if (t) return t;
-    }
+  if (repoId) {
+    // chat_template.jinja is a standalone file on some repos
+    // (fetched synchronously here since it's only reached when the embedded
+    // template is missing; caller handles the await)
   }
   return "";
-}
-
-async function fetchText(url: string, timeoutMs: number): Promise<string | null> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal });
-    if (!r.ok) return null;
-    return await r.text();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(t);
-  }
 }
 
 async function fetchHfMeta(repoId: string): Promise<ModelMeta | null> {
   const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
   if (!cfg || typeof cfg !== "object") return null;
   const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
-  const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
-  let template = extractTemplate(tokCfg, null);
+  let template = extractTemplate(tokCfg, repoId);
   if (!template) {
     const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
     if (jinja) template = jinja;
   }
-  return { cfg, tokCfg, genCfg, template, source: "hf" };
+  return { cfg, tokCfg, template };
 }
 
+// Load model metadata from Hugging Face (remote-only).
+// - Full repo id (owner/name): try directly.
+// - Bare name: try MLXCEL_DEFAULT_ORG/name first, then HF search API.
 async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
-  // 1) Hugging Face remote-first.
-  //    - Full repo id (owner/name): try directly.
-  //    - Bare name: try MLXCEL_DEFAULT_ORG/name first, then HF search API.
-  if (modelId.includes("/")) {
-    // owner/name already — try directly
-    const meta = await fetchHfMeta(modelId);
-    if (meta) return meta;
-  } else if (!modelId.startsWith("/") && !modelId.startsWith("./") && !modelId.startsWith("../")) {
-    // Bare name — try default org first
-    const repoId = resolveRepoId(modelId);
-    if (repoId) {
-      const meta = await fetchHfMeta(repoId);
-      if (meta) return meta;
-    }
-    // Default org didn't match — search HF for the correct org
-    const found = await searchHfModel(modelId);
-    if (found) {
-      const meta = await fetchHfMeta(found);
-      if (meta) return meta;
-    }
+  if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
+    return null; // local path — no HF metadata
   }
-  // 2) Local failover: offline, gated/private, or local-path model ids.
-  //    Org-agnostic search — scans all owners in mlxcel store and HF hub cache.
-  const dir = localModelDir(modelId);
-  if (dir) {
-    const cfg = readJsonFile(join(dir, "config.json"));
-    if (cfg && typeof cfg === "object") {
-      const tokCfg = readJsonFile(join(dir, "tokenizer_config.json"));
-      const genCfg = readJsonFile(join(dir, "generation_config.json"));
-      const template = extractTemplate(tokCfg, dir);
-      return { cfg, tokCfg, genCfg, template, source: "local" };
-    }
+  if (modelId.includes("/")) {
+    return await fetchHfMeta(modelId);
+  }
+  // Bare name — try default org first
+  const repoId = resolveRepoId(modelId);
+  if (repoId) {
+    const meta = await fetchHfMeta(repoId);
+    if (meta) return meta;
+  }
+  // Default org didn't match — search HF for the correct org
+  const found = await searchHfModel(modelId);
+  if (found) {
+    const meta = await fetchHfMeta(found);
+    if (meta) return meta;
   }
   return null;
 }
@@ -409,19 +268,6 @@ function detectReasoning(ids: Set<string> | null, template: string): boolean {
     return false;
   }
   return /enable_thinking|reasoning_content|clear_thinking|<think|<\/think/.test(template || "");
-}
-
-function detectTools(tokCfg: Cfg, ids: Set<string> | null, template: string): boolean {
-  if (tokCfg && tokCfg.tool_parser_type) return true;
-  if (ids) {
-    if (ids.has("tools")) {
-      for (const k of ["tool_call", "tool_calls", "tool", "function_call", "function"]) {
-        if (ids.has(k)) return true;
-      }
-    }
-    return false;
-  }
-  return /tool_call|function_call/.test(template || "") && /tools/.test(template || "");
 }
 
 // --- cache ------------------------------------------------------------------
@@ -491,11 +337,10 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
   }
 
   const meta = await loadModelMeta(modelId);
-  const fbCtx = envInt("MLXCEL_AUTO_FALLBACK_CTX", 32768);
+  const fallbackCtx = envInt("MLXCEL_AUTO_MAXOUT", 32768);
   if (!meta) {
     const entry: CacheEntry = {
-      modelMaxCtx: fbCtx, vision: false, reasoning: false, tools: false,
-      source: "fallback", ts: Date.now(),
+      modelMaxCtx: fallbackCtx, vision: false, reasoning: false,
     };
     cache[modelId] = entry;
     return entry;
@@ -504,25 +349,13 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
   const ctx =
     extractContext(meta.cfg) ??
     (meta.tokCfg && Number.isFinite(meta.tokCfg.model_max_length) ? meta.tokCfg.model_max_length : undefined) ??
-    fbCtx;
-  const modelType = meta.cfg?.model_type ?? meta.cfg?.text_config?.model_type;
-  const architectures = Array.isArray(meta.cfg?.architectures) ? meta.cfg.architectures : undefined;
+    fallbackCtx;
   const eosToken = meta.cfg?.eos_token_id ?? meta.tokCfg?.eos_token;
-  const quantBits = meta.cfg?.quantization?.bits;
-  const quantization = quantBits != null ? `${quantBits}-bit` : (meta.cfg?.quantization?.group_size != null ? "quantized" : undefined);
-  const genMaxNewTokens = meta.genCfg?.max_new_tokens ?? meta.genCfg?.max_length;
   const entry: CacheEntry = {
     modelMaxCtx: ctx,
     vision: isVision(meta.cfg, meta.tokCfg, ids),
     reasoning: detectReasoning(ids, meta.template),
-    tools: detectTools(meta.tokCfg, ids, meta.template),
-    source: meta.source,
-    ts: Date.now(),
-    modelType,
-    architectures,
     eosToken,
-    quantization,
-    genMaxNewTokens,
   };
   cache[modelId] = entry;
   return entry;
@@ -532,7 +365,8 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
 // `context_size` on /health and /slots. With `--ctx-size 0` (model default) it
 // reports 0, meaning unbounded up to model max, so the caller keeps the model
 // max. With an explicit `--ctx-size C --parallel N`, it reports floor(C / N),
-// the real per-slot budget, which should override.
+// the real per-slot budget, which should override. Other servers (e.g. mlx-lm)
+// don't provide these endpoints — they return 0 and the model max is used.
 async function fetchEffectiveCtx(origin: string): Promise<number> {
   const h = await fetchJson(`${origin}/health`, PROBE_TIMEOUT_MS);
   if (h && Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
@@ -697,16 +531,9 @@ export default async function (pi: ExtensionAPI) {
         if (arg && !id.includes(arg)) continue;
         const e = cache[id];
         lines.push(
-          `${id}: ctx ${e.modelMaxCtx} | vision ${e.vision ? "yes" : "no"} | reasoning ${e.reasoning ? "yes" : "no"} | tools ${e.tools ? "yes" : "no"} | ${e.source}`,
+          `${id}: ctx ${e.modelMaxCtx} | vision ${e.vision ? "yes" : "no"} | reasoning ${e.reasoning ? "yes" : "no"}`,
         );
-        const meta = [
-          e.modelType ? `model_type=${e.modelType}` : null,
-          e.architectures ? `arch=${e.architectures.join("|")}` : null,
-          e.quantization ? `quant=${e.quantization}` : null,
-          e.eosToken != null ? `eos=${e.eosToken}` : null,
-          e.genMaxNewTokens != null ? `genMaxNewTokens=${e.genMaxNewTokens}` : null,
-        ].filter(Boolean);
-        if (meta.length) lines.push(`  ${meta.join("  ")}`);
+        if (typeof e.eosToken === "string") lines.push(`  eos=${e.eosToken}`);
       }
       if (!lines.length) {
         ctx.ui.notify(`mlxcel-auto: no cached model matching "${arg}"`, "warn");
