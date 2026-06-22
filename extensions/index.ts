@@ -294,7 +294,7 @@ async function probeServer(origin: string): Promise<any[] | null> {
   return data.data as any[];
 }
 
-async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> {
+async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry | null> {
   const cached = cache[modelId];
   if (cached) {
     // Migrate pre-0.3.0 entries that used `contextWindow`.
@@ -305,15 +305,9 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
   }
 
   const meta = await loadModelMeta(modelId);
-  const fallbackCtx = envInt("MLXCEL_AUTO_MAXOUT", 32768);
-  if (!meta) {
-    const entry: CacheEntry = {
-      modelMaxCtx: fallbackCtx, vision: false, reasoning: false,
-    };
-    cache[modelId] = entry;
-    return entry;
-  }
+  if (!meta) return null; // HF 404 — skip this model
   const ids = templateIdentifiers(meta.template);
+  const fallbackCtx = envInt("MLXCEL_AUTO_MAXOUT", 32768);
   const ctx =
     extractContext(meta.cfg) ??
     (meta.tokCfg && Number.isFinite(meta.tokCfg.model_max_length) ? meta.tokCfg.model_max_length : undefined) ??
@@ -370,6 +364,7 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       const id: string = m.id ?? m.model ?? "";
       if (!id) continue;
       const meta = await resolveModel(id, cache);
+      if (!meta) continue; // HF 404 — skip model not on Hugging Face
       const ctx = effectiveCtx > 0 ? effectiveCtx : meta.modelMaxCtx;
       const maxTokens = Math.min(ctx, maxOut);
       const regId = resolveRepoId(id) ?? id;
