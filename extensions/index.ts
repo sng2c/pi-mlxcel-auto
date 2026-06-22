@@ -22,6 +22,7 @@
  * Config (env vars):
  *   MLXCEL_AUTO_PORTS  comma-separated ports to probe (default: "8080")
  *   MLXCEL_AUTO_HOST   host to probe (default: "127.0.0.1")
+ *   MLXCEL_AUTO_SCHEME  URL scheme for the server (default: "http")
  *   MLXCEL_AUTO_APIKEY api key sent to the server (default: "not-needed")
  *   MLXCEL_AUTO_MAXOUT cap on maxTokens (default: 32768)
  *   MLXCEL_AUTO_FALLBACK_CTX  context window used when detection fails (default: 32768)
@@ -123,9 +124,13 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
 // --- local model dir resolution --------------------------------------------
 
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
-// mlxcel resolves a bare name (no slash) as `${MLXCEL_DEFAULT_ORG}/<name>`.
-// Returns null for local filesystem paths and opaque aliases that cannot be
-// mapped to a Hugging Face repo id.
+// mlxcel-server returns bare snapshot names (e.g. "gemma-3-4b-it-qat-4bit")
+// even when launched with a full repo id ("mlx-community/gemma-3-4b-it-qat-4bit").
+// We try the server's /v1/models response id first; if it's already owner/name we
+// use it as-is. Otherwise we need an org to construct the HF URL. The default is
+// "mlx-community" because that's where most MLX-quantized models live, but it's
+// configurable via MLXCEL_DEFAULT_ORG for other orgs. If the guess is wrong, HF
+// returns 404 and we fall back to the local model store — so it's never fatal.
 function resolveRepoId(modelId: string): string | null {
   if (!modelId) return null;
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
@@ -332,8 +337,8 @@ function saveCache(c: Cache) {
 
 // --- discovery + registration ----------------------------------------------
 
-async function probePort(host: string, port: number): Promise<any[] | null> {
-  const data = await fetchJson(`http://${host}:${port}/v1/models`, PROBE_TIMEOUT_MS);
+async function probePort(scheme: string, host: string, port: number): Promise<any[] | null> {
+  const data = await fetchJson(`${scheme}://${host}:${port}/v1/models`, PROBE_TIMEOUT_MS);
   if (!data || !Array.isArray(data.data)) return null;
   return data.data as any[];
 }
@@ -391,10 +396,10 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry> 
 // reports 0, meaning unbounded up to model max, so the caller keeps the model
 // max. With an explicit `--ctx-size C --parallel N`, it reports floor(C / N),
 // the real per-slot budget, which should override.
-async function fetchEffectiveCtx(host: string, port: number): Promise<number> {
-  const h = await fetchJson(`http://${host}:${port}/health`, PROBE_TIMEOUT_MS);
+async function fetchEffectiveCtx(scheme: string, host: string, port: number): Promise<number> {
+  const h = await fetchJson(`${scheme}://${host}:${port}/health`, PROBE_TIMEOUT_MS);
   if (h && Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
-  const slots = await fetchJson(`http://${host}:${port}/slots`, PROBE_TIMEOUT_MS);
+  const slots = await fetchJson(`${scheme}://${host}:${port}/slots`, PROBE_TIMEOUT_MS);
   if (Array.isArray(slots)) {
     for (const s of slots) {
       const cs = s?.context_size;
@@ -405,6 +410,7 @@ async function fetchEffectiveCtx(host: string, port: number): Promise<number> {
 }
 
 async function discoverAndRegister(pi: ExtensionAPI) {
+  const scheme = env("MLXCEL_AUTO_SCHEME", "http");
   const host = env("MLXCEL_AUTO_HOST", "127.0.0.1");
   const ports = env("MLXCEL_AUTO_PORTS", "8080")
     .split(",")
@@ -418,13 +424,13 @@ async function discoverAndRegister(pi: ExtensionAPI) {
   const failures: string[] = [];
 
   for (const port of ports) {
-    const models = await probePort(host, port);
+    const models = await probePort(scheme, host, port);
     if (models === null) {
-      failures.push(`${host}:${port} not reachable`);
+      failures.push(`${scheme}://${host}:${port} not reachable`);
       continue;
     }
     const providerId = port === 8080 ? "mlxcel-auto" : `mlxcel-auto-${port}`;
-    const effectiveCtx = await fetchEffectiveCtx(host, port);
+    const effectiveCtx = await fetchEffectiveCtx(scheme, host, port);
     const regModels = [];
     for (const m of models) {
       const id: string = m.id ?? m.model ?? "";
@@ -469,7 +475,7 @@ async function discoverAndRegister(pi: ExtensionAPI) {
       continue;
     }
     pi.registerProvider(providerId, {
-      baseUrl: `http://${host}:${port}/v1`,
+      baseUrl: `${scheme}://${host}:${port}/v1`,
       apiKey,
       api: "openai-completions",
       models: regModels,

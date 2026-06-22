@@ -46,6 +46,7 @@ Then in pi:
 | --- | --- | --- |
 | `MLXCEL_AUTO_PORTS` | `8080` | Comma-separated ports to probe, e.g. `8080,8081` |
 | `MLXCEL_AUTO_HOST` | `127.0.0.1` | Host to probe |
+| `MLXCEL_AUTO_SCHEME` | `http` | URL scheme for the server (`http` or `https`) |
 | `MLXCEL_AUTO_APIKEY` | `not-needed` | API key sent to the server |
 | `MLXCEL_AUTO_MAXOUT` | `32768` | Cap on `maxTokens` |
 | `MLXCEL_AUTO_FALLBACK_CTX` | `32768` | Context window used when detection fails |
