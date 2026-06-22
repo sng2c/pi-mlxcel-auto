@@ -91,6 +91,13 @@ pi를 실행하거나, 이미 실행 중이면 `/reload`합니다. 수동으로 
 
 등록된 `contextWindow`은 `--ctx-size`가 명시적으로 설정된 경우 서버의 실제 per-slot `context_size`(`/health` 또는 `/slots`), 그렇지 않으면 `modelMaxCtx`입니다.
 
+### 업데이트 정책
+
+- **캐시 히트**: 캐시된 메타데이터를 그대로 사용. Hugging Face를 재조회하지 않음 — 나중에 모델이 HF에서 사라져도 캐시 항목이 로컬 사용을 유지합니다.
+- **캐시 미스 + HF 조회 성공**: 메타데이터를 가져와 영구 캐싱.
+- **캐시 미스 + HF 404**: 모델을 **스킵** — `/model`에 나타나지 않습니다.
+- **수동 갱신**: `~/.pi/agent/extensions-data/mlxcel-auto-cache.json`(또는 특정 항목)을 삭제하고 `/mlxcel-auto` 재실행.
+
 pi에서 `/mlxcel-auto-info [부분문자열]`로 확인할 수 있습니다.
 
 ## 라이선스
