@@ -8,7 +8,7 @@
 
 1. 설정된 각 서버 URL(`/v1/models`)을 프로브합니다. 기본값 `http://127.0.0.1:8080`.
 2. 각 모델 id에 대해:
-   - Hugging Face에서 먼저 메타데이터를 가져옵니다(`config.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja`). HF에 접근할 수 없거나, 모델이 gated/private이거나, id가 로컬 경로인 경우 로컬 mlxcel 모델 스토어로 폴백합니다. 결과는 캐시됩니다.
+   - Hugging Face에서 먼저 메타데이터를 가져옵니다(`config.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja`). HF에 접근할 수 없거나, 모델이 gated/private이거나, id가 로컬 경로인 경우 로컬 모델 스토어(mlxcel 캐시와 Hugging Face 허브 캐시 모두)로 폴백합니다. 결과는 캐시됩니다.
    - 슬래시가 없는 모델 이름은 `${MLXCEL_DEFAULT_ORG}/<이름>`(기본값 `mlx-community`)으로 해석됩니다. 조직 추측이 틀려도 HF가 404를 반환하고 로컬 폴백이 적용되므로 치명적이지 않습니다.
    - `max_position_embeddings`(최상위, 그 다음 `text_config.*`)에서 컨텍스트 윈도우를 추출합니다.
    - `vision_config` 또는 토크나이저 이미지/비디오 토큰에서 비전을 감지합니다.
@@ -69,6 +69,7 @@ pi를 실행하거나, 이미 실행 중이면 `/reload`합니다. 수동으로 
 | `MLXCEL_DEFAULT_ORG` | `mlx-community` | 서버가 소유자 접두어 없는 이름을 반환할 때 bare 모델 이름 앞에 붙일 조직명. 추측이 틀려도 HF 404 → 로컬 폴백으로 치명적이지 않음 |
 | `MLXCEL_MODELS_DIR` | (설정 안 함) | mlxcel 모델 스토어 루트 경로 오버라이드 |
 | `MLXCEL_CACHE_DIR` | `~/.cache/mlxcel` | mlxcel 캐시 루트 경로 오버라이드 |
+| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | Hugging Face 허브 캐시 위치 (mlx-lm 로컬 모델 탐지에 사용) |
 
 ## 참고 / 제한사항
 

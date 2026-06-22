@@ -8,7 +8,7 @@ Supports both `http` and `https` endpoints, local and remote servers.
 
 1. Probes each configured server URL (`/v1/models`), default `http://127.0.0.1:8080`.
 2. For each model id:
-   - Fetches metadata from Hugging Face first (`config.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja`). Falls back to the local mlxcel model store if HF is unreachable, the model is gated/private, or the id is a local path. Results are cached.
+   - Fetches metadata from Hugging Face first (`config.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja`). Falls back to the local model store (both mlxcel cache and Hugging Face hub cache) if HF is unreachable, the model is gated/private, or the id is a local path. Results are cached.
    - Bare model names (no slash) are resolved as `${MLXCEL_DEFAULT_ORG}/<name>` (default `mlx-community`), matching mlxcel's own resolver. If the org guess is wrong, HF returns 404 and local fallback applies â€” never fatal.
    - Extracts the context window from `max_position_embeddings` (top-level, then `text_config.*`).
    - Detects vision from `vision_config` or tokenizer image/video tokens.
@@ -69,6 +69,7 @@ Select `mlxcel-auto/<model>` in `/model`. The context window is auto-detected â€
 | `MLXCEL_DEFAULT_ORG` | `mlx-community` | Org used to resolve bare model names when the server returns a name without an owner prefix |
 | `MLXCEL_MODELS_DIR` | (unset) | Override mlxcel model-store root |
 | `MLXCEL_CACHE_DIR` | `~/.cache/mlxcel` | Override mlxcel cache root |
+| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | Hugging Face hub cache location (used for mlx-lm local model discovery) |
 
 ## Notes / limitations
 

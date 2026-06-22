@@ -7,8 +7,9 @@
  * local and remote servers.
  *
  * Metadata source is remote-first (Hugging Face), falling back to the local
- * mlxcel model store when HF is unreachable, the model is gated/private, or
- * the id is a local path. Results are cached.
+ * model store when HF is unreachable, the model is gated/private, or the id is
+ * a local path. The local search covers both the mlxcel store and the Hugging
+ * Face hub cache, so mlx-lm models are found as well. Results are cached.
  *
  * Beyond context, also detects:
  *   - reasoning/thinking: from chat_template tokens (enable_thinking /
@@ -32,6 +33,7 @@
  *   MLXCEL_DEFAULT_ORG         org for bare model names (default: "mlx-community")
  *   MLXCEL_MODELS_DIR           override mlxcel model-store root (default: unset)
  *   MLXCEL_CACHE_DIR            override mlxcel cache root (default: "~/.cache/mlxcel")
+ *   HF_HUB_CACHE / HF_HOME      Hugging Face hub cache location (used for mlx-lm models)
  *
  * Registers a provider per base URL; the provider id is "mlxcel-auto" for the
  * default (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
@@ -39,7 +41,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { tokenize } from "@huggingface/jinja";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -155,10 +157,29 @@ function localModelDir(modelId: string): string | null {
   const owner = parts[0];
   const name = parts.slice(1).join("/");
   const dirs: string[] = [];
+  // 1) Explicit override
   const md = process.env.MLXCEL_MODELS_DIR;
   if (md) dirs.push(join(md, owner, name));
+  // 2) mlxcel store
   const cacheDir = process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`;
   dirs.push(join(cacheDir, "models", owner, name));
+  // 3) Hugging Face hub cache (mlx-lm and other HF-based tools store models here)
+  //    Layout: models--owner--name/snapshots/<hash>/config.json
+  const hfCacheDir = process.env.HF_HUB_CACHE || process.env.HF_HOME
+    ? join(process.env.HF_HUB_CACHE || process.env.HF_HOME!, "hub")
+    : `${homedir()}/.cache/huggingface/hub`;
+  const hfModelDir = join(hfCacheDir, `models--${owner}--${name}`);
+  if (existsSync(hfModelDir)) {
+    const snapshotsDir = join(hfModelDir, "snapshots");
+    try {
+      const entries = readdirSync(snapshotsDir);
+      // Pick the latest snapshot (alphabetical = most recent commit hash)
+      const latest = entries.sort().pop();
+      if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
+        dirs.push(join(snapshotsDir, latest));
+      }
+    } catch {}
+  }
   for (const d of dirs) {
     if (existsSync(join(d, "config.json"))) return d;
   }
