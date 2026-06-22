@@ -27,7 +27,7 @@
  *   MLXCEL_AUTO_MAXOUT         cap on maxTokens, also used as fallback context (default: 32768)
  *   MLXCEL_AUTO_NO_REASONING   "1" disables automatic reasoning detection
  *   MLXCEL_AUTO_NO_CACHE       "1" disables the on-disk config cache
- *   MLXCEL_DEFAULT_ORG         org for bare model names, tried first before HF search (default: "mlx-community")
+ *   MLXCEL_DEFAULT_ORG         org for bare model names (default: "mlx-community")
  *
  * Registers a provider per base URL; the provider id is "mlxcel-auto" for the
  * default (http on 127.0.0.1:8080) or "mlxcel-auto-{host}-{port}" otherwise.
@@ -123,8 +123,7 @@ async function fetchText(url: string, timeoutMs: number): Promise<string | null>
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
 // - Full repo id (contains "/"): returned as-is.
 // - Bare name: resolved as MLXCEL_DEFAULT_ORG/<name> (default "mlx-community").
-//   If that HF URL returns 404, the caller falls back to the HF search API
-//   to find the correct org automatically.
+//   If that HF URL returns 404, the caller uses fallback context — no search.
 function resolveRepoId(modelId: string): string | null {
   if (!modelId) return null;
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
@@ -133,24 +132,6 @@ function resolveRepoId(modelId: string): string | null {
   if (modelId.includes("/")) return modelId; // owner/name already
   const org = env("MLXCEL_DEFAULT_ORG", "mlx-community");
   return `${org}/${modelId}`;
-}
-
-// Search the HF Hub API for a model matching the given bare name.
-// Returns the repo id of the most downloaded match, or null.
-async function searchHfModel(bareName: string): Promise<string | null> {
-  const data = await fetchJson(
-    `https://huggingface.co/api/models?search=${encodeURIComponent(bareName)}&sort=downloads&direction=-1&limit=5`,
-    HTTP_TIMEOUT_MS,
-  );
-  if (!data || !Array.isArray(data)) return null;
-  for (const m of data) {
-    const id: string = m?.id ?? "";
-    // Prefer exact match on the name part (after "/")
-    if (id && id.split("/").pop() === bareName) return id;
-  }
-  // No exact name match; return the first result if any
-  if (data.length > 0 && typeof data[0]?.id === "string") return data[0].id;
-  return null;
 }
 
 // Extract the chat template text from tokenizer_config.json (string or
@@ -188,27 +169,14 @@ async function fetchHfMeta(repoId: string): Promise<ModelMeta | null> {
 
 // Load model metadata from Hugging Face (remote-only).
 // - Full repo id (owner/name): try directly.
-// - Bare name: try MLXCEL_DEFAULT_ORG/name first, then HF search API.
+// - Bare name: try MLXCEL_DEFAULT_ORG/name. 404 → fallback (no search).
 async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
     return null; // local path — no HF metadata
   }
-  if (modelId.includes("/")) {
-    return await fetchHfMeta(modelId);
-  }
-  // Bare name — try default org first
   const repoId = resolveRepoId(modelId);
-  if (repoId) {
-    const meta = await fetchHfMeta(repoId);
-    if (meta) return meta;
-  }
-  // Default org didn't match — search HF for the correct org
-  const found = await searchHfModel(modelId);
-  if (found) {
-    const meta = await fetchHfMeta(found);
-    if (meta) return meta;
-  }
-  return null;
+  if (!repoId) return null;
+  return await fetchHfMeta(repoId);
 }
 
 // --- detection -------------------------------------------------------------

@@ -64,7 +64,7 @@ pi를 실행하거나, 이미 실행 중이면 `/reload`합니다. 수동으로 
 | `MLXCEL_AUTO_MAXOUT` | `32768` | `maxTokens` 상한; 감지 실패 시 폴백 컨텍스트로도 사용 |
 | `MLXCEL_AUTO_NO_REASONING` | (끄기) | `1`이면 자동 리소닝/사고 감지 비활성화 |
 | `MLXCEL_AUTO_NO_CACHE` | (끄기) | `1`이면 디스크 설정 캐시 비활성화 |
-| `MLXCEL_DEFAULT_ORG` | `mlx-community` | bare 모델 이름 해석 시 먼저 시도할 조직. 404면 HF 검색 API로 자동 해석 |
+| `MLXCEL_DEFAULT_ORG` | `mlx-community` | bare 모델 이름 앞에 붙일 조직. 404면 폴백 사용 |
 
 ## 참고 / 제한사항
 
@@ -72,8 +72,8 @@ pi를 실행하거나, 이미 실행 중이면 `/reload`합니다. 수동으로 
 - **컨텍스트 윈도우**: `--ctx-size`가 명시적으로 설정된 경우 서버의 실제 per-slot `context_size`(`/health` 또는 `/slots`)에서 해석됩니다. 그렇지 않으면 `config.json`의 `max_position_embeddings`에서 가져온 모델 최대값으로 폴백합니다. 서버가 실제로 할당한 것보다 큰 윈도우를 pi가 가정하지 못하게 합니다.
 - **비전**: `vision_config` 또는 토크나이저 이미지/비디오 토큰에서 감지됩니다. `input: ["text","image"]`로 매핑됩니다. pi의 모델 `input` 필드는 텍스트/이미지만 지원하므로 비디오/오디오는 표현할 수 없습니다.
 - **스탑 토큰 트림**: `message_end` 훅이 `mlxcel-auto` 모델에 대해서만 완성된 어시스턴트 메시지 끝에 누출된 스톱 토큰(예: Qwen `<|im_end|>`, Gemma `<end_of_turn>`, GLM ``)을 제거합니다. config/tokenizer_config의 모델별 문자열 `eos_token`도 사용 가능 시 적용됩니다.
-- **메타데이터 소스**: 원격 전용(Hugging Face). bare 이름은 `MLXCEL_DEFAULT_ORG/<이름>`을 먼저 시도하고, 404면 HF 검색 API로 자동 해석합니다. 둘 다 실패하면 폴백 컨텍스트(`MLXCEL_AUTO_MAXOUT`)를 사용합니다. 로컬 파일 읽기 없음 — mlxcel, mlx-lm, 모든 OpenAI 호환 서버에 동일하게 작동합니다.
-- **기본 조직**: `mlxcel-server`는 전체 `owner/name` 리포지토리 id로 시작해도 `/v1/models`에서 bare 스냅샷 디렉토리 이름만 보고합니다. bare 이름은 `MLXCEL_DEFAULT_ORG/<이름>`(기본값 `mlx-community`)을 먼저 시도하고, 404면 Hugging Face 검색 API로 올바른 조직을 자동으로 찾습니다. 어느 조직의 모델이든 자동으로 처리됩니다. 첫 번째 시도할 조직은 `MLXCEL_DEFAULT_ORG`로 오버라이드할 수 있습니다.
+- **메타데이터 소스**: 원격 전용(Hugging Face). bare 이름은 `MLXCEL_DEFAULT_ORG/<이름>`(기본값 `mlx-community`)으로 해석됩니다. 404면 폴백 컨텍스트(`MLXCEL_AUTO_MAXOUT`)를 사용합니다 — 검색 안 함. 로컬 파일 읽기 없음 — mlxcel, mlx-lm, 모든 OpenAI 호환 서버에 동일하게 작동합니다.
+- **기본 조직**: `mlxcel-server`는 전체 `owner/name` 리포지토리 id로 시작해도 `/v1/models`에서 bare 스냅샷 디렉토리 이름만 보고합니다. bare 이름은 `MLXCEL_DEFAULT_ORG/<이름>`(기본값 `mlx-community`)으로 해석됩니다. 조직 추측이 틀려도(404) 폴백 컨텍스트가 사용됩니다. `MLXCEL_DEFAULT_ORG`로 오버라이드할 수 있습니다.
 - 리소닝은 감지되지 않은 경우 기본값이 `false`입니다. 모델별로 오버라이드하려면 `~/.pi/agent/models.json`에 `mlxcel` 프로바이더를 추가하세요 — 이 확장은 `mlxcel-auto` 프로바이더 id를 사용하므로 충돌이 없습니다.
 - `--alias <custom>`으로 시작하면 id가 리포지토리 id가 아니므로 해석할 수 없습니다. 이 경우 수동 `models.json` 항목으로 폴백하세요.
 - **HTTPS**: `MLXCEL_AUTO_BASEURLS=https://...`를 설정하여 원격 또는 TLS 종단 mlxcel-server에 연결합니다. `http`와 `https` 모두 완전히 지원됩니다.
