@@ -66,7 +66,7 @@ Select `mlxcel-auto/<model>` in `/model`. The context window is auto-detected â€
 | `MLXCEL_AUTO_FALLBACK_CTX` | `32768` | Context window used when detection fails |
 | `MLXCEL_AUTO_NO_REASONING` | (off) | `1` disables automatic reasoning/thinking detection |
 | `MLXCEL_AUTO_NO_CACHE` | (off) | `1` disables the on-disk config cache |
-| `MLXCEL_DEFAULT_ORG` | `mlx-community` | Org used to resolve bare model names when the server returns a name without an owner prefix |
+| `MLXCEL_DEFAULT_ORG` | `mlx-community` | Org tried first for bare model names. Falls back to HF search API on 404 |
 | `MLXCEL_MODELS_DIR` | (unset) | Override mlxcel model-store root |
 | `MLXCEL_CACHE_DIR` | `~/.cache/mlxcel` | Override mlxcel cache root |
 | `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | Hugging Face hub cache location (used for mlx-lm local model discovery) |
@@ -80,7 +80,7 @@ Select `mlxcel-auto/<model>` in `/model`. The context window is auto-detected â€
 - **stop-token trim**: a `message_end` hook strips trailing leaked stop tokens (e.g. Qwen `<|im_end|>`, Gemma `<end_of_turn>`, GLM ``) from finalized assistant messages for `mlxcel-auto` models only. Per-model string `eos_token` from config/tokenizer_config is also used when available.
 - **metadata source**: remote-first. The extension fetches `config.json` / `tokenizer_config.json` / `generation_config.json` / `chat_template.jinja` from Hugging Face first, then falls back to the local mlxcel store / model dir if HF is unreachable (offline), the model is gated/private, or the id is a local path. Results are cached. This makes remote mlxcel servers work with no extra config.
 - **metadata cached**: `model_type`, `architectures`, `eos_token`, `quantization`, `gen_max_new_tokens` (from `generation_config.json`). Audio/video modalities are not yet split out (pi `input` only accepts text/image); see the TODO in the source for future wiring.
-- **default org**: `mlxcel-server` reports the bare snapshot directory name in `/v1/models` even when launched with a full `owner/name` repo id. Bare names are resolved as `MLXCEL_DEFAULT_ORG/<name>` (default `mlx-community`). If the org guess is wrong, HF returns 404 and local fallback applies â€” never fatal. Override with `MLXCEL_DEFAULT_ORG`.
+- **default org**: `mlxcel-server` reports the bare snapshot directory name in `/v1/models` even when launched with a full `owner/name` repo id. Bare names are resolved by trying `MLXCEL_DEFAULT_ORG/<name>` first (default `mlx-community`), then the Hugging Face search API if that 404s. This handles models from any org automatically. If both fail, local fallback applies. Override the first-try org with `MLXCEL_DEFAULT_ORG`.
 - `reasoning` defaults to `false` when not detected. Add a `mlxcel` provider in `~/.pi/agent/models.json` to override per model â€” this extension uses the `mlxcel-auto` provider id so there is no collision.
 - If you launch with `--alias <custom>` the id is not a repo id and cannot be resolved; fall back to a manual `models.json` entry in that case.
 - **HTTPS**: set `MLXCEL_AUTO_BASEURLS=https://...` to connect to a remote or TLS-terminated mlxcel-server. Both `http` and `https` are fully supported.

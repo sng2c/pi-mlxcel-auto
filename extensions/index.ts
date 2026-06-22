@@ -30,7 +30,7 @@
  *   MLXCEL_AUTO_FALLBACK_CTX   context window when detection fails (default: 32768)
  *   MLXCEL_AUTO_NO_REASONING   "1" disables automatic reasoning detection
  *   MLXCEL_AUTO_NO_CACHE        "1" disables the on-disk config cache
- *   MLXCEL_DEFAULT_ORG         org for bare model names (default: "mlx-community")
+ *   MLXCEL_DEFAULT_ORG         org for bare model names, tried first before HF search (default: "mlx-community")
  *   MLXCEL_MODELS_DIR           override mlxcel model-store root (default: unset)
  *   MLXCEL_CACHE_DIR            override mlxcel cache root (default: "~/.cache/mlxcel")
  *   HF_HUB_CACHE / HF_HOME      Hugging Face hub cache location (used for mlx-lm models)
@@ -130,11 +130,11 @@ async function fetchJson(url: string, timeoutMs: number): Promise<any | null> {
 // --- local model dir resolution --------------------------------------------
 
 // Resolve a model id (as returned by /v1/models) to an `owner/name` repo id.
-// mlxcel-server returns bare snapshot names (e.g. "gemma-3-4b-it-qat-4bit")
-// even when launched with a full repo id ("mlx-community/gemma-3-4b-it-qat-4bit").
-// Bare names are resolved as MLXCEL_DEFAULT_ORG/<name> (default "mlx-community").
-// If the guess is wrong, HF returns 404 and we fall back to the local model
-// store — so it's never fatal.
+// - Full repo id (contains "/"): returned as-is.
+// - Local path (starts with "/", "./", "../"): null (not a HF repo).
+// - Bare name: resolved as MLXCEL_DEFAULT_ORG/<name> (default "mlx-community").
+//   If that HF URL returns 404, the caller falls back to the HF search API
+//   to find the correct org automatically.
 function resolveRepoId(modelId: string): string | null {
   if (!modelId) return null;
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
@@ -145,42 +145,92 @@ function resolveRepoId(modelId: string): string | null {
   return `${org}/${modelId}`;
 }
 
+// Search the HF Hub API for a model matching the given bare name.
+// Returns the repo id of the most downloaded match, or null.
+async function searchHfModel(bareName: string): Promise<string | null> {
+  const data = await fetchJson(
+    `https://huggingface.co/api/models?search=${encodeURIComponent(bareName)}&sort=downloads&direction=-1&limit=5`,
+    HTTP_TIMEOUT_MS,
+  );
+  if (!data || !Array.isArray(data)) return null;
+  for (const m of data) {
+    const id: string = m?.id ?? "";
+    // Prefer exact match on the name part (after "/")
+    if (id && id.split("/").pop() === bareName) return id;
+  }
+  // No exact name match; return the first result if any
+  if (data.length > 0 && typeof data[0]?.id === "string") return data[0].id;
+  return null;
+}
+
+// Find a local model directory by scanning for the model name, org-agnostic.
+// Searches: 1) explicit MLXCEL_MODELS_DIR, 2) mlxcel store, 3) HF hub cache.
+// For stores with an org/ directory structure, scans all orgs for a matching name.
+// For the HF hub cache, scans models--*--<name> patterns.
 function localModelDir(modelId: string): string | null {
   // Local directory path passed as -m?
   if (modelId.startsWith("/") || modelId.startsWith("./") || modelId.startsWith("../")) {
     const maybeDir = modelId.startsWith("/") ? modelId : join(process.cwd(), modelId);
     if (existsSync(join(maybeDir, "config.json"))) return maybeDir;
   }
-  const repoId = resolveRepoId(modelId);
-  if (!repoId) return null;
-  const parts = repoId.split("/");
-  const owner = parts[0];
-  const name = parts.slice(1).join("/");
-  const dirs: string[] = [];
-  // 1) Explicit override
+
+  // Determine name (after "/") and a candidate owner for exact-match paths.
+  const slashIdx = modelId.indexOf("/");
+  const name = slashIdx >= 0 ? modelId.slice(slashIdx + 1) : modelId;
+  const knownOwner = slashIdx >= 0 ? modelId.slice(0, slashIdx) : null;
+
+  const candidates: string[] = [];
+
+  // 1) Explicit override (uses known owner or MLXCEL_DEFAULT_ORG)
   const md = process.env.MLXCEL_MODELS_DIR;
-  if (md) dirs.push(join(md, owner, name));
-  // 2) mlxcel store
+  if (md) {
+    if (knownOwner) {
+      candidates.push(join(md, knownOwner, name));
+    } else {
+      const org = env("MLXCEL_DEFAULT_ORG", "mlx-community");
+      candidates.push(join(md, org, name));
+    }
+  }
+
+  // 2) mlxcel store: scan all org dirs for a matching model name
   const cacheDir = process.env.MLXCEL_CACHE_DIR || `${homedir()}/.cache/mlxcel`;
-  dirs.push(join(cacheDir, "models", owner, name));
-  // 3) Hugging Face hub cache (mlx-lm and other HF-based tools store models here)
-  //    Layout: models--owner--name/snapshots/<hash>/config.json
-  const hfCacheDir = process.env.HF_HUB_CACHE || process.env.HF_HOME
-    ? join(process.env.HF_HUB_CACHE || process.env.HF_HOME!, "hub")
-    : `${homedir()}/.cache/huggingface/hub`;
-  const hfModelDir = join(hfCacheDir, `models--${owner}--${name}`);
-  if (existsSync(hfModelDir)) {
-    const snapshotsDir = join(hfModelDir, "snapshots");
+  const mlxcelModels = join(cacheDir, "models");
+  if (existsSync(mlxcelModels)) {
     try {
-      const entries = readdirSync(snapshotsDir);
-      // Pick the latest snapshot (alphabetical = most recent commit hash)
-      const latest = entries.sort().pop();
-      if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
-        dirs.push(join(snapshotsDir, latest));
+      for (const entry of readdirSync(mlxcelModels)) {
+        const candidate = join(mlxcelModels, entry, name);
+        if (existsSync(join(candidate, "config.json"))) {
+          candidates.push(candidate);
+        }
       }
     } catch {}
   }
-  for (const d of dirs) {
+
+  // 3) HF hub cache: scan models--*--<name> patterns
+  const hfCacheDir = process.env.HF_HUB_CACHE || process.env.HF_HOME
+    ? join(process.env.HF_HUB_CACHE || process.env.HF_HOME!, "hub")
+    : `${homedir()}/.cache/huggingface/hub`;
+  const hfModelsPrefix = `models--`;
+  const hfNamePattern = `--${name}`;
+  if (existsSync(hfCacheDir)) {
+    try {
+      for (const entry of readdirSync(hfCacheDir)) {
+        if (entry.startsWith(hfModelsPrefix) && entry.endsWith(hfNamePattern)) {
+          const snapshotsDir = join(hfCacheDir, entry, "snapshots");
+          try {
+            const commits = readdirSync(snapshotsDir).sort();
+            const latest = commits[commits.length - 1];
+            if (latest && existsSync(join(snapshotsDir, latest, "config.json"))) {
+              candidates.push(join(snapshotsDir, latest));
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // Return the first candidate with config.json (prioritize exact match)
+  for (const d of candidates) {
     if (existsSync(join(d, "config.json"))) return d;
   }
   return null;
@@ -238,24 +288,43 @@ async function fetchText(url: string, timeoutMs: number): Promise<string | null>
   }
 }
 
+async function fetchHfMeta(repoId: string): Promise<ModelMeta | null> {
+  const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
+  if (!cfg || typeof cfg !== "object") return null;
+  const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
+  const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
+  let template = extractTemplate(tokCfg, null);
+  if (!template) {
+    const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
+    if (jinja) template = jinja;
+  }
+  return { cfg, tokCfg, genCfg, template, source: "hf" };
+}
+
 async function loadModelMeta(modelId: string): Promise<ModelMeta | null> {
-  // 1) Hugging Face first (remote-first). Works for remote mlxcel servers
-  //    where local model files are absent, and gives consistent metadata.
-  const repoId = resolveRepoId(modelId);
-  if (repoId) {
-    const cfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/config.json`, HTTP_TIMEOUT_MS);
-    if (cfg && typeof cfg === "object") {
-      const tokCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/tokenizer_config.json`, HTTP_TIMEOUT_MS);
-      const genCfg = await fetchJson(`https://huggingface.co/${repoId}/raw/main/generation_config.json`, HTTP_TIMEOUT_MS);
-      let template = extractTemplate(tokCfg, null);
-      if (!template) {
-        const jinja = await fetchText(`https://huggingface.co/${repoId}/raw/main/chat_template.jinja`, HTTP_TIMEOUT_MS);
-        if (jinja) template = jinja;
-      }
-      return { cfg, tokCfg, genCfg, template, source: "hf" };
+  // 1) Hugging Face remote-first.
+  //    - Full repo id (owner/name): try directly.
+  //    - Bare name: try MLXCEL_DEFAULT_ORG/name first, then HF search API.
+  if (modelId.includes("/")) {
+    // owner/name already — try directly
+    const meta = await fetchHfMeta(modelId);
+    if (meta) return meta;
+  } else if (!modelId.startsWith("/") && !modelId.startsWith("./") && !modelId.startsWith("../")) {
+    // Bare name — try default org first
+    const repoId = resolveRepoId(modelId);
+    if (repoId) {
+      const meta = await fetchHfMeta(repoId);
+      if (meta) return meta;
+    }
+    // Default org didn't match — search HF for the correct org
+    const found = await searchHfModel(modelId);
+    if (found) {
+      const meta = await fetchHfMeta(found);
+      if (meta) return meta;
     }
   }
-  // 2) local failover: offline, gated/private, or local-path model ids.
+  // 2) Local failover: offline, gated/private, or local-path model ids.
+  //    Org-agnostic search — scans all owners in mlxcel store and HF hub cache.
   const dir = localModelDir(modelId);
   if (dir) {
     const cfg = readJsonFile(join(dir, "config.json"));
