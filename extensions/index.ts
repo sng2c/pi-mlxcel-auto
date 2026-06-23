@@ -70,6 +70,7 @@ interface CacheEntry {
   vision: boolean;
   reasoning: boolean;
   eosToken?: string | number;
+  source?: "huggingface" | "server";
 }
 
 interface ModelMeta {
@@ -304,7 +305,7 @@ async function probeServer(origin: string): Promise<any[] | null> {
   return data.data as any[];
 }
 
-async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry | null> {
+async function resolveModel(modelId: string, cache: Cache, serverMeta?: { context_window?: number; reasoning_parser?: string | null; modality?: string } | null): Promise<CacheEntry | null> {
   const cached = cache[modelId];
   if (cached) {
     // Migrate pre-0.3.0 entries that used `contextWindow`.
@@ -314,13 +315,29 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry |
     return cached;
   }
 
-  const meta = await loadModelMeta(modelId);
-  if (!meta) return null; // HF 404 — skip this model
-  const ids = templateIdentifiers(meta.template);
   const fallbackCtx = envInt("MLXCEL_AUTO_MAXOUT", 32768);
+  const meta = await loadModelMeta(modelId);
+  if (!meta) {
+    // HF unreachable — fall back to server-provided metadata from /v1/models
+    if (!serverMeta) return null; // no server metadata either — skip
+    const ctx = (Number.isFinite(serverMeta.context_window) && (serverMeta.context_window as number) > 0)
+      ? serverMeta.context_window as number
+      : fallbackCtx;
+    const entry: CacheEntry = {
+      modelMaxCtx: ctx,
+      vision: serverMeta.modality === "multimodal" || (serverMeta.modality ?? "").includes("image"),
+      reasoning: serverMeta.reasoning_parser != null && serverMeta.reasoning_parser !== "",
+      eosToken: undefined,
+      source: "server",
+    };
+    cache[modelId] = entry;
+    return entry;
+  }
+  const ids = templateIdentifiers(meta.template);
   const ctx =
     extractContext(meta.cfg) ??
     (meta.tokCfg && Number.isFinite(meta.tokCfg.model_max_length) ? meta.tokCfg.model_max_length : undefined) ??
+    (serverMeta && Number.isFinite(serverMeta.context_window) && (serverMeta.context_window as number) > 0 ? serverMeta.context_window : undefined) ??
     fallbackCtx;
   const eosToken = meta.cfg?.eos_token_id ?? meta.tokCfg?.eos_token;
   const entry: CacheEntry = {
@@ -328,6 +345,7 @@ async function resolveModel(modelId: string, cache: Cache): Promise<CacheEntry |
     vision: isVision(meta.cfg, meta.tokCfg, ids),
     reasoning: detectReasoning(ids, meta.template),
     eosToken,
+    source: "huggingface",
   };
   cache[modelId] = entry;
   return entry;
@@ -373,8 +391,14 @@ async function discoverAndRegister(pi: ExtensionAPI) {
     for (const m of models) {
       const id: string = m.id ?? m.model ?? "";
       if (!id) continue;
-      const meta = await resolveModel(id, cache);
-      if (!meta) continue; // HF 404 — skip model not on Hugging Face
+      // Pass server-provided metadata from /v1/models as fallback for when HF is unreachable
+      const serverMeta = {
+        context_window: Number.isFinite(m.context_window) ? m.context_window : undefined,
+        reasoning_parser: m.reasoning_parser ?? null,
+        modality: m.modality ?? undefined,
+      };
+      const meta = await resolveModel(id, cache, serverMeta);
+      if (!meta) continue; // no HF metadata and no server metadata — skip
       const ctx = effectiveCtx > 0 ? effectiveCtx : meta.modelMaxCtx;
       const maxTokens = Math.min(ctx, maxOut);
       const regId = resolveRepoId(id) ?? id;
