@@ -35,7 +35,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { tokenize } from "@huggingface/jinja";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 
 const CACHE_PATH = `${homedir()}/.pi/agent/extensions-data/mlxcel-auto-cache.json`;
@@ -262,6 +263,7 @@ function loadCache(): Cache {
 function saveCache(c: Cache) {
   if (env("MLXCEL_AUTO_NO_CACHE", "") === "1") return;
   try {
+    mkdirSync(dirname(CACHE_PATH), { recursive: true });
     writeFileSync(CACHE_PATH, JSON.stringify(c, null, 2));
   } catch {}
 }
@@ -355,11 +357,17 @@ async function resolveModel(modelId: string, cache: Cache, serverMeta?: { contex
 // `context_size` on /health and /slots. With `--ctx-size 0` (model default) it
 // reports 0, meaning unbounded up to model max, so the caller keeps the model
 // max. With an explicit `--ctx-size C --parallel N`, it reports floor(C / N),
-// the real per-slot budget, which should override. Other servers (e.g. mlx-lm)
-// don't provide these endpoints — they return 0 and the model max is used.
+// the real per-slot budget, which should override. Other servers (e.g. mlx-lm,
+// rapid-mlx) don't expose these endpoints in the same shape — we detect the
+// server flavor from /health and only probe /slots on mlxcel-server to avoid
+// spurious 404s in the server log.
 async function fetchEffectiveCtx(origin: string): Promise<number> {
   const h = await fetchJson(`${origin}/health`, PROBE_TIMEOUT_MS);
-  if (h && Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
+  // mlxcel-server: /health includes `context_size` (and /slots is available).
+  // Any other server (rapid-mlx, mlx-lm, ...): skip /slots entirely.
+  if (!h || typeof h !== "object") return 0;
+  if (!("context_size" in h)) return 0;
+  if (Number.isFinite(h.context_size) && h.context_size > 0) return h.context_size;
   const slots = await fetchJson(`${origin}/slots`, PROBE_TIMEOUT_MS);
   if (Array.isArray(slots)) {
     for (const s of slots) {
