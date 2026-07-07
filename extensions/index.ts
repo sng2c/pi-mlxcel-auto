@@ -307,12 +307,49 @@ async function probeServer(origin: string): Promise<any[] | null> {
   return data.data as any[];
 }
 
+function firstPositiveNumber(...values: unknown[]): number | undefined {
+  for (const v of values) {
+    if (Number.isFinite(v) && (v as number) > 0) return v as number;
+  }
+  return undefined;
+}
+
+function serverContextWindow(model: any): number | undefined {
+  const meta = model?.meta ?? {};
+  return firstPositiveNumber(
+    model?.context_window,
+    model?.contextWindow,
+    model?.context_length,
+    model?.n_ctx,
+    meta?.context_window,
+    meta?.contextWindow,
+    meta?.context_length,
+    meta?.n_ctx,
+    meta?.n_ctx_train,
+  );
+}
+
 async function resolveModel(modelId: string, cache: Cache, serverMeta?: { context_window?: number; reasoning_parser?: string | null; modality?: string } | null): Promise<CacheEntry | null> {
   const cached = cache[modelId];
   if (cached) {
     // Migrate pre-0.3.0 entries that used `contextWindow`.
     if (cached.modelMaxCtx == null && (cached as any).contextWindow != null) {
       cached.modelMaxCtx = (cached as any).contextWindow;
+    }
+    // Refresh server-sourced cache entries with the latest /v1/models metadata.
+    // HF-sourced entries are stable and intentionally left untouched. vision and
+    // reasoning are OR-combined (one-way ratchet): a capability once advertised is
+    // kept even if a later server report omits it, since false positives are safer
+    // than false negatives for these flags.
+    if (
+      cached.source === "server" &&
+      serverMeta &&
+      Number.isFinite(serverMeta.context_window) &&
+      (serverMeta.context_window as number) > 0
+    ) {
+      cached.modelMaxCtx = serverMeta.context_window as number;
+      cached.vision = cached.vision || serverMeta.modality === "multimodal" || (serverMeta.modality ?? "").includes("image");
+      cached.reasoning = cached.reasoning || (serverMeta.reasoning_parser != null && serverMeta.reasoning_parser !== "");
     }
     return cached;
   }
@@ -399,9 +436,13 @@ async function discoverAndRegister(pi: ExtensionAPI) {
     for (const m of models) {
       const id: string = m.id ?? m.model ?? "";
       if (!id) continue;
-      // Pass server-provided metadata from /v1/models as fallback for when HF is unreachable
+      // Pass server-provided metadata from /v1/models as fallback for when HF is unreachable.
+      // Probe several field names (top-level and under `meta`) since mlxcel/llama.cpp
+      // servers report context window varies across context_window, n_ctx, context_length,
+      // and n_ctx_train.
+      const serverCtx = serverContextWindow(m);
       const serverMeta = {
-        context_window: Number.isFinite(m.context_window) ? m.context_window : undefined,
+        context_window: serverCtx,
         reasoning_parser: m.reasoning_parser ?? null,
         modality: m.modality ?? undefined,
       };
